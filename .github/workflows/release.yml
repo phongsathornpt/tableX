@@ -1,0 +1,171 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Checks (Linux)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - run: cargo fmt -- --check
+      - run: cargo check --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  package:
+    name: Package ${{ matrix.name }}
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Apple Silicon
+            os: macos-15
+            asset: macos-aarch64
+            kind: macos
+          - name: macOS Intel
+            os: macos-15-intel
+            asset: macos-x86_64
+            kind: macos
+          - name: Linux x86_64
+            os: ubuntu-24.04
+            asset: linux-x86_64
+            kind: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          test "${TAG_NAME#v}" = "$cargo_version" || {
+            echo "Tag $TAG_NAME must match Cargo.toml version $cargo_version (expected v$cargo_version)"
+            exit 1
+          }
+      - name: Install Linux native build dependencies
+        if: matrix.kind == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libdbus-1-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb-randr0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            pkg-config
+      - name: Build Linux package
+        if: matrix.kind == 'linux'
+        run: |
+          cargo build --locked --release
+          cargo install cargo-packager --locked --version 0.11.8
+          cargo packager --release --config Packager.linux.toml
+          mkdir -p dist/release-assets
+          install -m 0755 target/release/tableX dist/release-assets/tableX
+          cat > dist/release-assets/tableX.desktop <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=tableX
+          Comment=PostgreSQL database management
+          Exec=tableX
+          Terminal=false
+          Categories=Development;Database;
+          EOF
+          tar -C dist/release-assets -czf "dist/tablex-${{ matrix.asset }}.tar.gz" tableX tableX.desktop
+          deb_file="$(find dist -maxdepth 1 -type f -name '*.deb' -print -quit)"
+          test -n "$deb_file"
+          mv "$deb_file" "dist/tablex-${{ matrix.asset }}.deb"
+      - name: Build macOS packages
+        if: matrix.kind == 'macos'
+        run: |
+          cargo build --locked --release
+          cargo install cargo-packager --locked --version 0.11.8
+          cargo packager --release --config Packager.macos.toml
+          mkdir -p dist/release-assets
+          app_path="$(find dist -maxdepth 2 -type d -name '*.app' -print -quit)"
+          dmg_path="$(find dist -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          test -n "$app_path"
+          test -n "$dmg_path"
+          tar -C "$(dirname "$app_path")" -czf "dist/tablex-${{ matrix.asset }}.tar.gz" "$(basename "$app_path")"
+          mv "$dmg_path" "dist/tablex-${{ matrix.asset }}.dmg"
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.asset }}
+          path: dist/tablex-*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+      - name: Prepare release files and checksums
+        run: |
+          cp install.sh dist/install.sh
+          cd dist
+          sha256sum tablex-* > SHA256SUMS
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=(--verify-tag --generate-notes)
+          case "${GITHUB_REF_NAME}" in
+            *-alpha*|*-beta*|*-rc*) args+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" dist/* "${args[@]}"

@@ -12,8 +12,8 @@ use gpui_kit::component::{
     scroll::{ScrollableElement as _, ScrollbarHandle as _},
 };
 use gpui_kit::{
-    Context, Entity, FontWeight, IntoElement, ParentElement as _, StatefulInteractiveElement as _,
-    Styled as _, UniformListScrollHandle, div, px, uniform_list,
+    Context, Entity, FontWeight, IntoElement, ParentElement as _, SharedString,
+    StatefulInteractiveElement as _, Styled as _, UniformListScrollHandle, div, px, uniform_list,
 };
 
 pub struct ObjectExplorer {
@@ -48,10 +48,10 @@ enum ExplorerRow {
         expanded: bool,
     },
     Table {
-        schema: String,
-        category: &'static str,
-        index: usize,
-        name: String,
+        schema: SharedString,
+        name: SharedString,
+        row_id: SharedString,
+        tooltip_label: SharedString,
     },
 }
 
@@ -143,10 +143,13 @@ impl ObjectExplorer {
                 if expanded {
                     rows.extend(category.tables.iter().enumerate().map(|(index, table)| {
                         ExplorerRow::Table {
-                            schema: schema.clone(),
-                            category: category.label,
-                            index,
-                            name: table.name.clone(),
+                            schema: SharedString::new(schema),
+                            name: SharedString::new(&table.name),
+                            row_id: SharedString::new(format!(
+                                "table-row-{schema}-{}-{index}",
+                                category.label
+                            )),
+                            tooltip_label: SharedString::new(format!("{schema}.{}", table.name)),
                         }
                     }));
                 }
@@ -461,17 +464,18 @@ fn render_explorer_row(
         }
         ExplorerRow::Table {
             schema,
-            category,
-            index,
             name,
+            row_id,
+            tooltip_label,
         } => {
             let schema_for_open = schema.clone();
             let name_for_open = name.clone();
-            let tooltip_label = format!("{schema}.{name}");
+            let tooltip_label = tooltip_label.clone();
             let is_selected = selected_table.is_some_and(|(selected_schema, selected_name)| {
-                selected_schema == schema && selected_name == name
+                selected_schema.as_str() == schema.as_str()
+                    && selected_name.as_str() == name.as_str()
             });
-            ListItem::new(format!("table-row-{schema}-{category}-{index}"))
+            ListItem::new(row_id.clone())
                 .w_full()
                 .h(px(28.))
                 .selected(is_selected)
@@ -497,7 +501,12 @@ fn render_explorer_row(
                 })
                 .on_click(move |_, window, cx| {
                     workspace.update(cx, |this, cx| {
-                        this.preview_table(&schema_for_open, &name_for_open, window, cx)
+                        this.preview_table(
+                            schema_for_open.as_str(),
+                            name_for_open.as_str(),
+                            window,
+                            cx,
+                        )
                     })
                 })
         }

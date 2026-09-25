@@ -42,6 +42,7 @@ pub(crate) fn connect(
     let table_page_generation = workspace.table_page_generation;
     workspace.table_page_loading = true;
     workspace.query_result = None;
+    workspace.result_column_widths = Default::default();
     workspace.refresh_table_data_filter_cache(cx);
     workspace.query_generation = workspace.query_generation.wrapping_add(1);
     workspace.query_running = false;

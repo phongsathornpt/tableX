@@ -25,7 +25,7 @@ pub(super) fn render_result_row(
         .h(px(38.))
         .items_center()
         .gap_0()
-        .px_3()
+        .px_2()
         .py_1()
         .bg(if row_index.is_multiple_of(2) {
             cx.theme().table

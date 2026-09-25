@@ -1,0 +1,8 @@
+product-name = "tableX"
+version = "0.1.0"
+identifier = "io.tablex.app"
+description = "A desktop PostgreSQL database management application"
+binaries = [{ path = "tableX", main = true }]
+binaries-dir = "target/release"
+out-dir = "dist"
+formats = ["app", "dmg"]

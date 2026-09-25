@@ -12,6 +12,7 @@ pub(in crate::ui::home::query) use row::{
 pub(crate) fn render_result(
     cx: &mut Context<DatabaseWorkspace>,
     result: Option<&QueryResult>,
+    column_widths: Rc<Vec<f32>>,
     table_data_offset: usize,
     table_data_limit: usize,
     table_data_has_next: bool,
@@ -66,21 +67,6 @@ pub(crate) fn render_result(
     let eager_cell_tooltips = EAGER_CELL_TOOLTIPS_FOR_BENCHMARK.load(Ordering::Relaxed);
     #[cfg(not(test))]
     let eager_cell_tooltips = false;
-    let column_widths = result
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| {
-            table_column_width(
-                column,
-                result
-                    .column_types
-                    .get(index)
-                    .map(String::as_str)
-                    .unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>();
     let (visible_column_indices, leading_column_width, trailing_column_width) =
         visible_column_window(
             &result.columns,
@@ -94,13 +80,17 @@ pub(crate) fn render_result(
         .gap_0()
         .px_2()
         .h(px(56.))
+        .flex_shrink_0()
         .border_b_1()
         .border_color(cx.theme().border)
         .bg(cx.theme().table_head);
     if workspace_layout {
         header = header.child(
-            div()
+            h_flex()
                 .w(px(40.))
+                .h_full()
+                .flex_shrink_0()
+                .items_center()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
                 .child("#"),
@@ -117,18 +107,15 @@ pub(crate) fn render_result(
             .get(index)
             .cloned()
             .unwrap_or_else(|| "unknown".to_owned());
-        let is_sorted = table_data_sort
-            .map(|(sorted_column, _)| sorted_column == column)
-            .unwrap_or(false);
-        let sort_label = if is_sorted {
-            if table_data_sort.is_some_and(|(_, descending)| *descending) {
-                format!("{column_type} ↓")
-            } else {
-                format!("{column_type} ↑")
-            }
+        let sortable = result.editable.is_some();
+        let sort_direction = if sortable {
+            table_data_sort.and_then(|(sorted_column, descending)| {
+                (sorted_column == column).then_some(*descending)
+            })
         } else {
-            column_type.to_owned()
+            None
         };
+        let is_sorted = sort_direction.is_some();
         let column_width = column_widths[index];
         let column_name = column.clone();
         let sort_workspace = workspace.clone();
@@ -150,6 +137,11 @@ pub(crate) fn render_result(
             .xsmall()
             .icon(Icon::new(gpui_kit::assets::IconName::ListFilter))
             .selected(filter_is_active)
+            .accessibility_label(if filter_is_active {
+                format!("Edit filter for {column}")
+            } else {
+                format!("Filter {column}")
+            })
             .tooltip(if filter_is_active {
                 format!("Edit filter for {column}")
             } else {
@@ -295,29 +287,117 @@ pub(crate) fn render_result(
                 })
                 .into_any_element()
         } else {
-            div().w(px(30.)).into_any_element()
+            div().w(px(0.)).into_any_element()
+        };
+        let sort_accessibility_label = match (sortable, sort_direction) {
+            (false, _) => {
+                format!("{column_name}, {column_type}. Sorting is unavailable for query results.")
+            }
+            (true, Some(true)) => {
+                format!("Sort by {column_name}, currently descending. Activate to sort ascending.")
+            }
+            (true, Some(false)) => {
+                format!("Sort by {column_name}, currently ascending. Activate to sort descending.")
+            }
+            (true, None) => format!("Sort by {column_name} ascending."),
+        };
+        let sort_tooltip = if sortable {
+            match sort_direction {
+                Some(true) => format!("{column_name} · {column_type} · Sorted descending"),
+                Some(false) => format!("{column_name} · {column_type} · Sorted ascending"),
+                None => format!("{column_name} · {column_type} · Sort ascending"),
+            }
+        } else {
+            format!("{column_name} · {column_type} · Sort with SQL ORDER BY")
+        };
+        let sort_indicator = match sort_direction {
+            Some(true) => "↓",
+            Some(false) => "↑",
+            None => "",
+        };
+        let column_label = v_flex()
+            .w_full()
+            .min_w(px(0.))
+            .gap_0()
+            .child(
+                div()
+                    .w_full()
+                    .min_w(px(0.))
+                    .text_sm()
+                    .font_weight(if is_sorted {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .child(column_name.clone()),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w(px(0.))
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(column_type.clone()),
+                    )
+                    .child(if is_sorted {
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().primary)
+                            .child(sort_indicator)
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    }),
+            );
+        let sort_control = if sortable {
+            Button::new(format!("sort-column-{index}"))
+                .ghost()
+                .flex_1()
+                .min_w(px(0.))
+                .small()
+                .h(px(56.))
+                .justify_start()
+                .px_1()
+                .accessibility_label(sort_accessibility_label)
+                .tooltip(sort_tooltip)
+                .child(column_label)
+                .on_click(move |_, window, cx| {
+                    sort_workspace.update(cx, |this, cx| {
+                        this.set_table_data_sort(column_name.clone(), window, cx)
+                    })
+                })
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .h(px(56.))
+                .px_1()
+                .items_center()
+                .child(column_label)
+                .into_any_element()
         };
         Some(
             h_flex()
                 .w(px(column_width))
-                .h(px(48.))
+                .h(px(56.))
+                .flex_shrink_0()
                 .items_center()
                 .gap_0()
-                .child(
-                    Button::new(format!("sort-column-{index}"))
-                        .ghost()
-                        .flex_1()
-                        .small()
-                        .h(px(48.))
-                        .justify_start()
-                        .label(format!("{column_name}\n{sort_label}"))
-                        .tooltip(format!("Sort by {column_name} ({column_type})"))
-                        .on_click(move |_, window, cx| {
-                            sort_workspace.update(cx, |this, cx| {
-                                this.set_table_data_sort(column_name.clone(), window, cx)
-                            })
-                        }),
-                )
+                .child(sort_control)
                 .child(filter_control),
         )
     }));
@@ -386,7 +466,7 @@ pub(crate) fn render_result(
     } else {
         if workspace_layout {
             let row_indices = filtered_row_indices;
-            let column_widths = Rc::new(column_widths.clone());
+            let column_widths = column_widths.clone();
             let visible_column_indices = Rc::new(visible_column_indices);
             let workspace = workspace.clone();
             let active_cell_edit = active_cell_edit.clone();
@@ -1135,6 +1215,26 @@ pub(crate) fn render_result(
     }
 }
 
+pub(crate) fn result_column_widths(result: &QueryResult) -> Rc<Vec<f32>> {
+    Rc::new(
+        result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                table_column_width(
+                    column,
+                    result
+                        .column_types
+                        .get(index)
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                )
+            })
+            .collect(),
+    )
+}
+
 pub(crate) fn visible_column_window(
     columns: &[String],
     column_widths: &[f32],
@@ -1142,56 +1242,67 @@ pub(crate) fn visible_column_window(
     workspace_layout: bool,
     scroll: Option<&gpui_kit::ScrollHandle>,
 ) -> (Vec<usize>, f32, f32) {
-    let all_visible_columns = columns
-        .iter()
-        .enumerate()
-        .filter_map(|(index, name)| (!hidden_columns.contains(name)).then_some(index))
-        .collect::<Vec<_>>();
     let Some(scroll) = scroll.filter(|_| workspace_layout) else {
-        return (all_visible_columns, 0., 0.);
+        return (
+            columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (!hidden_columns.contains(name)).then_some(index))
+                .collect(),
+            0.,
+            0.,
+        );
     };
     let viewport_width = scroll.bounds().size.width.as_f32();
     if viewport_width <= 0. {
-        return (all_visible_columns, 0., 0.);
+        return (
+            columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (!hidden_columns.contains(name)).then_some(index))
+                .collect(),
+            0.,
+            0.,
+        );
     }
 
     let viewport_left = (-scroll.offset().x.as_f32()).max(0.);
     let viewport_right = viewport_left + viewport_width;
-    let mut column_left = if workspace_layout { 40. } else { 0. };
-    let first_visible_position = all_visible_columns.iter().position(|index| {
-        let right = column_left + column_widths[*index];
-        let intersects = right > viewport_left && column_left < viewport_right;
-        column_left = right;
-        intersects
-    });
-    let Some(first_visible_position) = first_visible_position else {
-        return (all_visible_columns, 0., 0.);
-    };
+    let content_left = if workspace_layout { 40. } else { 0. };
+    let mut column_left = content_left;
+    let mut first_visible_left = None;
+    let mut visible_columns = Vec::new();
+    let mut trailing_width = 0.;
 
-    column_left = if workspace_layout { 40. } else { 0. };
-    for index in all_visible_columns.iter().take(first_visible_position) {
-        column_left += column_widths[*index];
-    }
-    let first_visible_left = column_left;
-    let mut visible_end_position = first_visible_position;
-    for (position, index) in all_visible_columns
-        .iter()
-        .enumerate()
-        .skip(first_visible_position)
-    {
-        let right = column_left + column_widths[*index];
-        if column_left >= viewport_right {
-            break;
+    for (index, name) in columns.iter().enumerate() {
+        if hidden_columns.contains(name) {
+            continue;
         }
-        visible_end_position = position + 1;
-        column_left = right;
+        let width = column_widths[index];
+        let column_right = column_left + width;
+        if column_right > viewport_left && column_left < viewport_right {
+            first_visible_left.get_or_insert(column_left);
+            visible_columns.push(index);
+        } else if first_visible_left.is_some() && column_left >= viewport_right {
+            trailing_width += width;
+        }
+        column_left = column_right;
     }
-    let visible_columns =
-        all_visible_columns[first_visible_position..visible_end_position].to_vec();
-    let trailing_width = all_visible_columns[visible_end_position..]
-        .iter()
-        .map(|index| column_widths[*index])
-        .sum();
-    let leading_width = first_visible_left - if workspace_layout { 40. } else { 0. };
-    (visible_columns, leading_width, trailing_width)
+
+    let Some(first_visible_left) = first_visible_left else {
+        return (
+            columns
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (!hidden_columns.contains(name)).then_some(index))
+                .collect(),
+            0.,
+            0.,
+        );
+    };
+    (
+        visible_columns,
+        first_visible_left - content_left,
+        trailing_width,
+    )
 }

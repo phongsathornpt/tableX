@@ -84,6 +84,16 @@ move database access into views just to simplify a screen implementation.
 - Error copy should identify the failed action, explain the likely cause, and
   provide the next safe action. For example, distinguish an invalid certificate
   from invalid credentials or an unreachable host.
+- Data-grid headers should distinguish column names from type metadata, show
+  the active sort direction clearly, and expose sort controls only when the
+  current result source can apply the sort. Truncated names must retain a way
+  to discover the full value.
+- Keep header cells, row cells, row-number gutters, and trailing action columns
+  aligned at every horizontal scroll position. Header and row rendering must use
+  the same column widths and visibility rules.
+- Keep table previews responsive with virtualized row rendering and bounded
+  eager result views. Cache column layout derived from a result set instead of
+  rebuilding it on every render; keep database work off the UI thread.
 - Keep destructive or security-sensitive actions visually and semantically
   distinct from routine navigation.
 - Preserve keyboard access, visible focus, readable contrast, and clear labels

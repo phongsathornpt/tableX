@@ -569,6 +569,7 @@ pub(crate) fn finish_mutation(
     match result {
         Ok(result) => {
             workspace.query_result = None;
+            workspace.result_column_widths = Default::default();
             workspace.notice = Some(Notice::success(format!(
                 "Write committed: {} row(s) affected",
                 result.affected_rows
@@ -601,6 +602,8 @@ pub(crate) fn finish_table_preview(
     match result {
         Ok(result) => {
             let row_count = result.rows.len();
+            workspace.result_column_widths =
+                crate::ui::homepage::query::result_column_widths(&result);
             workspace.table_data_offset = result.offset;
             workspace.table_data_limit = result.limit;
             workspace.table_data_has_next = result.has_next;
@@ -614,6 +617,7 @@ pub(crate) fn finish_table_preview(
         }
         Err(error) => {
             workspace.query_result = None;
+            workspace.result_column_widths = Default::default();
             workspace.notice = Some(if workspace.cell_update_reload_pending {
                 workspace.cell_update_reload_pending = false;
                 Notice::warning(
@@ -647,6 +651,8 @@ pub(crate) fn finish_query(
     match result {
         Ok(result) => {
             let row_count = result.rows.len();
+            workspace.result_column_widths =
+                crate::ui::homepage::query::result_column_widths(&result);
             workspace.query_result = Some(Arc::new(result));
             workspace.notice = Some(Notice::success(format!(
                 "Query completed: {row_count} row(s) returned"
@@ -654,6 +660,7 @@ pub(crate) fn finish_query(
         }
         Err(error) => {
             workspace.query_result = None;
+            workspace.result_column_widths = Default::default();
             workspace.notice = Some(
                 Notice::error(
                     "Query could not be completed",

@@ -32,6 +32,7 @@ pub(crate) struct HomepageView<'a> {
     pub(crate) server_version: Option<&'a str>,
     pub(crate) query_input: &'a Entity<TextareaState>,
     pub(crate) query_result: Option<&'a QueryResult>,
+    pub(crate) result_column_widths: Rc<Vec<f32>>,
     pub(crate) query_running: bool,
     pub(crate) write_confirmation_pending: bool,
 }
@@ -91,6 +92,7 @@ pub fn render(cx: &mut Context<DatabaseWorkspace>, view: HomepageView<'_>) -> im
         workspace = workspace.child(query::render_result(
             cx,
             view.query_result,
+            view.result_column_widths,
             0,
             500,
             false,
@@ -147,6 +149,7 @@ pub fn render_workspace(
     selected_table: Option<&(String, String)>,
     query_input: &Entity<TextareaState>,
     query_result: Option<&QueryResult>,
+    result_column_widths: Rc<Vec<f32>>,
     query_running: bool,
     write_confirmation_pending: bool,
     table_data_offset: usize,
@@ -286,6 +289,7 @@ pub fn render_workspace(
                                         .child(query::render_result(
                                             cx,
                                             query_result,
+                                            result_column_widths.clone(),
                                             table_data_offset,
                                             table_data_limit,
                                             table_data_has_next,

@@ -26,13 +26,13 @@ const TABLE_CELL_PREVIEW_CHARS: usize = 160;
 
 mod result_grid;
 
-pub(crate) use result_grid::render_result;
 #[cfg(test)]
 pub(crate) use result_grid::visible_column_window;
 #[cfg(test)]
 use result_grid::{
     is_inline_editable_cell, result_cell_value, table_column_width, visible_cell_prefix,
 };
+pub(crate) use result_grid::{render_result, result_column_widths};
 
 fn table_filter_operators(column_type: &str) -> Vec<(TableFilterOperator, &'static str)> {
     let mut operators = vec![
