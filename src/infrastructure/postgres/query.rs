@@ -9,7 +9,7 @@ use super::runtime;
 use super::sql::quote_identifier;
 #[cfg(test)]
 use super::value::cell_to_string;
-use super::value::cell_to_string_with_null;
+use super::value::{cell_to_string_with_null, enum_values as postgres_enum_values};
 use crate::domain::query::{
     CellUpdateRequest, EditableTable, MutationResult, QueryResult, TableColumnFilter,
     TableDataCursor, TableDataCursorDirection, TableFilterOperator, TablePreviewPageRequest,
@@ -559,6 +559,11 @@ async fn execute_query_client(
         .iter()
         .map(|column| column.type_().name().to_owned())
         .collect::<Vec<_>>();
+    let column_enum_values = statement
+        .columns()
+        .iter()
+        .map(|column| postgres_enum_values(column.type_()).map(<[String]>::to_vec))
+        .collect::<Vec<_>>();
     let decoded_rows = async {
         let mut rows = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
         let mut null_cells = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
@@ -593,6 +598,7 @@ async fn execute_query_client(
     Ok(QueryResult {
         columns,
         column_types,
+        column_enum_values,
         offset: 0,
         null_cells,
         limit: MAX_QUERY_ROWS,
@@ -668,6 +674,11 @@ async fn execute_table_preview_client(
         .columns()
         .iter()
         .map(|column| column.type_().name().to_owned())
+        .collect::<Vec<_>>();
+    let column_enum_values = statement
+        .columns()
+        .iter()
+        .map(|column| postgres_enum_values(column.type_()).map(<[String]>::to_vec))
         .collect::<Vec<_>>();
     // The normal preview query includes LIMIT limit+1 (limit is capped at 100).
     // Stream and decode rows as they arrive so a page of wide rows does not keep
@@ -842,6 +853,7 @@ async fn execute_table_preview_client(
     Ok(QueryResult {
         columns,
         column_types,
+        column_enum_values,
         null_cells,
         offset: usize::try_from(offset).expect("the offset was validated before execution"),
         limit,
@@ -1407,6 +1419,22 @@ mod preview_sql_tests {
     }
 
     #[test]
+    fn enum_equality_filter_uses_the_enum_type_cast() {
+        let filter = [TableColumnFilter {
+            column: "state".into(),
+            operator: TableFilterOperator::Equals,
+            value: Some("in review".into()),
+        }];
+        let columns = vec![("state".into(), "\"app\".\"workflow_state\"".into(), false)];
+        let (predicate, values) = build_filter_predicates(&filter, &columns).unwrap();
+        assert_eq!(
+            predicate,
+            r#""state" = (($1::text)::"app"."workflow_state")"#
+        );
+        assert_eq!(values, ["in review"]);
+    }
+
+    #[test]
     fn filters_reject_unknown_columns_unsupported_contains_and_oversized_values() {
         let columns = vec![("count".into(), "\"pg_catalog\".\"int4\"".into(), false)];
         let unknown = [TableColumnFilter {
@@ -1454,5 +1482,29 @@ mod preview_sql_tests {
             "UPDATE \"public\".\"items\" SET \"label\"\"value\" = (($1::text)::\"pg_catalog\".\"text\") WHERE \"tenant_id\" = (($2::text)::\"pg_catalog\".\"int4\") AND \"item_id\" = (($3::text)::\"pg_catalog\".\"uuid\") AND \"label\"\"value\" IS NOT DISTINCT FROM (($4::text)::\"pg_catalog\".\"text\")"
         );
         assert!(!sql.contains("DELETE FROM items"));
+    }
+
+    #[test]
+    fn enum_cell_update_casts_bound_values_to_the_qualified_enum_type() {
+        let request = CellUpdateRequest {
+            schema: "app".into(),
+            table: "tickets".into(),
+            column: "state".into(),
+            primary_key_columns: vec!["id".into()],
+            primary_key_values: vec!["8".into()],
+            value: Some("in review".into()),
+            expected_value: Some("draft".into()),
+        };
+        let sql = build_cell_update_sql(
+            "\"app\".\"tickets\"",
+            &request,
+            "\"app\".\"workflow_state\"",
+            &[("id".into(), "\"pg_catalog\".\"int4\"".into())],
+        );
+        assert_eq!(
+            sql,
+            "UPDATE \"app\".\"tickets\" SET \"state\" = (($1::text)::\"app\".\"workflow_state\") WHERE \"id\" = (($2::text)::\"pg_catalog\".\"int4\") AND \"state\" IS NOT DISTINCT FROM (($3::text)::\"app\".\"workflow_state\")"
+        );
+        assert!(!sql.contains("in review"));
     }
 }

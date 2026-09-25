@@ -142,9 +142,23 @@ pub(crate) fn begin_table_cell_edit(
     let Some(column) = result.columns.get(column_index) else {
         return;
     };
+    let enum_values = result
+        .column_enum_values
+        .get(column_index)
+        .and_then(Option::as_ref)
+        .filter(|values| !values.is_empty());
+    let is_enum = enum_values.is_some();
+    let enum_values = enum_values.map(|values| {
+        if values.len() <= super::MAX_ENUM_MENU_OPTIONS {
+            values.clone()
+        } else {
+            Vec::new()
+        }
+    });
     if table.primary_key_columns.is_empty()
         || table.primary_key_columns.iter().any(|key| key == column)
-        || !is_inline_edit_type(result.column_types.get(column_index).map(String::as_str))
+        || (!is_inline_edit_type(result.column_types.get(column_index).map(String::as_str))
+            && !is_enum)
     {
         return;
     }
@@ -169,7 +183,31 @@ pub(crate) fn begin_table_cell_edit(
         column_index,
         input: editor,
         set_null: is_null,
+        enum_value: (!is_null && is_enum).then(|| value.clone()),
+        enum_values,
     });
+    cx.notify();
+}
+
+pub(crate) fn select_table_cell_enum_value(
+    workspace: &mut DatabaseWorkspace,
+    value: String,
+    window: &mut Window,
+    cx: &mut Context<DatabaseWorkspace>,
+) {
+    let Some(edit) = workspace.active_cell_edit.as_mut() else {
+        return;
+    };
+    let Some(values) = edit.enum_values.as_ref() else {
+        return;
+    };
+    if !values.iter().any(|option| option == &value) {
+        return;
+    }
+    let input = edit.input.clone();
+    edit.enum_value = Some(value.clone());
+    edit.set_null = false;
+    input.update(cx, |input, cx| input.set_value(value, window, cx));
     cx.notify();
 }
 

@@ -2,6 +2,7 @@
 pub struct QueryResult {
     pub columns: Vec<String>,
     pub column_types: Vec<String>,
+    pub column_enum_values: Vec<Option<Vec<String>>>,
     pub rows: Vec<Vec<String>>,
     pub null_cells: Vec<Vec<bool>>,
     pub offset: usize,

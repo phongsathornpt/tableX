@@ -19,7 +19,7 @@ use crate::domain::query::{TableColumnFilter, TableFilterOperator};
 use crate::infrastructure::QueryResult;
 use crate::infrastructure::postgres::sql::{build_delete_sql, build_update_sql, quote_identifier};
 use crate::ui::DatabaseWorkspace;
-use crate::ui::database_workspace::QueryDockTab;
+use crate::ui::database_workspace::{MAX_ENUM_MENU_OPTIONS, QueryDockTab};
 use gpui_kit::base::Selectable as _;
 
 const TABLE_CELL_PREVIEW_CHARS: usize = 160;
@@ -506,6 +506,13 @@ pub(crate) fn render_result(
         let filter_is_active = table_column_filters
             .iter()
             .any(|filter| filter.column == *column);
+        let enum_values = result
+            .column_enum_values
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|values| values.len() <= MAX_ENUM_MENU_OPTIONS)
+            .cloned()
+            .unwrap_or_default();
         let operators = table_filter_operators(&column_type);
         let filter_button = Button::new(format!("filter-column-{index}"))
             .ghost()
@@ -574,6 +581,40 @@ pub(crate) fn render_result(
                     let apply_workspace = filter_workspace.clone();
                     let clear_workspace = filter_workspace.clone();
                     let clear_column = filter_column_name.clone();
+                    let value_control = if enum_values.is_empty() {
+                        Input::new(&input).w_full().into_any_element()
+                    } else {
+                        let values_for_menu = enum_values.clone();
+                        let workspace_for_value = filter_workspace.clone();
+                        h_flex()
+                            .gap_1()
+                            .child(Input::new(&input).flex_1())
+                            .child(
+                                Button::new(format!("enum-filter-values-{index}"))
+                                    .outline()
+                                    .small()
+                                    .dropdown_caret(true)
+                                    .label("Values")
+                                    .dropdown_menu(move |menu, _, _| {
+                                        values_for_menu.iter().fold(menu, |menu, value| {
+                                            let workspace = workspace_for_value.clone();
+                                            let value = value.clone();
+                                            menu.item(PopupMenuItem::new(value.clone()).on_click(
+                                                move |_, window, cx| {
+                                                    workspace.update(cx, |this, cx| {
+                                                        this.set_table_filter_input(
+                                                            value.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    });
+                                                },
+                                            ))
+                                        })
+                                    }),
+                            )
+                            .into_any_element()
+                    };
                     v_flex()
                         .w(px(272.))
                         .gap_2()
@@ -587,7 +628,7 @@ pub(crate) fn render_result(
                         .child(if is_null_operator {
                             div().into_any_element()
                         } else {
-                            Input::new(&input).w_full().into_any_element()
+                            value_control
                         })
                         .child(
                             h_flex()
@@ -1604,9 +1645,62 @@ fn render_result_row(
         if let Some(editor) = editing {
             let save_key_workspace = workspace.clone();
             let cancel_key_workspace = workspace.clone();
+            let editor_control = if let Some(enum_values) = editor
+                .enum_values
+                .as_ref()
+                .filter(|values| !values.is_empty() && values.len() <= MAX_ENUM_MENU_OPTIONS)
+            {
+                let workspace_for_value = workspace.clone();
+                let values_for_menu = enum_values.clone();
+                let selected_value = editor.enum_value.clone();
+                let value_label = if editor.set_null {
+                    "NULL".to_owned()
+                } else {
+                    selected_value
+                        .clone()
+                        .unwrap_or_else(|| "Choose a value".to_owned())
+                };
+                Button::new(format!("enum-cell-editor-{row_index}-{column_index}"))
+                    .outline()
+                    .small()
+                    .w_full()
+                    .disabled(editor.set_null || query_pending)
+                    .dropdown_caret(true)
+                    .label(value_label)
+                    .dropdown_menu(move |menu, _, _| {
+                        values_for_menu.iter().fold(menu, |menu, value| {
+                            let workspace = workspace_for_value.clone();
+                            let value = value.clone();
+                            menu.item(
+                                PopupMenuItem::new(value.clone())
+                                    .checked(selected_value.as_ref() == Some(&value))
+                                    .on_click(move |_, window, cx| {
+                                        workspace.update(cx, |this, cx| {
+                                            this.select_table_cell_enum_value(
+                                                value.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        });
+                                    }),
+                            )
+                        })
+                    })
+                    .into_any_element()
+            } else {
+                Input::new(&editor.input)
+                    .w_full()
+                    .small()
+                    .disabled(editor.set_null || query_pending)
+                    .into_any_element()
+            };
+            let enter_saves = editor
+                .enum_values
+                .as_ref()
+                .is_none_or(|values| values.is_empty() || values.len() > MAX_ENUM_MENU_OPTIONS);
             let editor = div()
                 .on_key_down(move |event, _, cx| match event.keystroke.key.as_str() {
-                    "enter" => save_key_workspace.update(cx, |this, cx| {
+                    "enter" if enter_saves => save_key_workspace.update(cx, |this, cx| {
                         this.save_table_cell_edit(cx);
                     }),
                     "escape" => cancel_key_workspace.update(cx, |this, cx| {
@@ -1614,12 +1708,7 @@ fn render_result_row(
                     }),
                     _ => {}
                 })
-                .child(
-                    Input::new(&editor.input)
-                        .w_full()
-                        .small()
-                        .disabled(editor.set_null || query_pending),
-                );
+                .child(editor_control);
             cell_element = cell_element.child(editor);
         } else {
             if is_boolean {
@@ -1802,9 +1891,12 @@ fn is_inline_editable_cell(result: &QueryResult, row_index: usize, column_index:
             .get(row_index)
             .and_then(|row| row.get(column_index))
             .is_some()
-        && crate::ui::database_workspace::is_inline_edit_type(
+        && (crate::ui::database_workspace::is_inline_edit_type(
             result.column_types.get(column_index).map(String::as_str),
-        )
+        ) || result
+            .column_enum_values
+            .get(column_index)
+            .is_some_and(|values| values.as_ref().is_some_and(|values| !values.is_empty())))
 }
 
 fn ends_with_ascii_case_insensitive(value: &str, suffix: &str) -> bool {
@@ -2043,6 +2135,7 @@ mod tests {
         let result = QueryResult {
             columns: vec!["large_text".into()],
             column_types: vec!["text".into()],
+            column_enum_values: vec![None],
             rows: vec![vec![value.clone()]],
             null_cells: vec![vec![false]],
             offset: 0,
@@ -2072,6 +2165,7 @@ mod tests {
         let result = QueryResult {
             columns: vec!["name".into()],
             column_types: vec!["text".into()],
+            column_enum_values: vec![None],
             rows: vec![vec!["first".into()], vec!["second".into()]],
             null_cells: vec![vec![false], vec![false]],
             offset: 0,
@@ -2100,6 +2194,7 @@ mod tests {
         let result = QueryResult {
             columns: vec!["name".into()],
             column_types: vec!["text".into()],
+            column_enum_values: vec![None],
             rows: vec![vec!["first".into()], vec!["second".into()]],
             null_cells: vec![vec![false], vec![false]],
             offset: 0,

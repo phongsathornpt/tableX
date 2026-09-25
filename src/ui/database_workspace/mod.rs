@@ -35,6 +35,8 @@ mod query;
 pub(crate) use connection_editor::ConnectionEditor;
 pub(crate) use query::is_inline_edit_type;
 
+pub(crate) const MAX_ENUM_MENU_OPTIONS: usize = 100;
+
 #[cfg(feature = "perf-overlay")]
 static STARTUP_RENDER_TIMING_REPORTED: AtomicBool = AtomicBool::new(false);
 
@@ -99,6 +101,8 @@ struct ActiveCellEdit {
     column_index: usize,
     input: gpui_kit::Entity<InputState>,
     set_null: bool,
+    enum_values: Option<Vec<String>>,
+    enum_value: Option<String>,
 }
 
 #[derive(Clone)]
@@ -107,6 +111,8 @@ pub(crate) struct ActiveCellEditView {
     pub(crate) column_index: usize,
     pub(crate) input: gpui_kit::Entity<InputState>,
     pub(crate) set_null: bool,
+    pub(crate) enum_values: Option<Vec<String>>,
+    pub(crate) enum_value: Option<String>,
 }
 
 impl DatabaseWorkspace {
@@ -428,6 +434,8 @@ impl DatabaseWorkspace {
                 column_index: edit.column_index,
                 input: edit.input.clone(),
                 set_null: edit.set_null,
+                enum_values: edit.enum_values.clone(),
+                enum_value: edit.enum_value.clone(),
             })
     }
 
@@ -470,6 +478,26 @@ impl DatabaseWorkspace {
             edit.set_null = set_null;
             cx.notify();
         }
+    }
+
+    pub(crate) fn select_table_cell_enum_value(
+        &mut self,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        query::select_table_cell_enum_value(self, value, window, cx);
+    }
+
+    pub(crate) fn set_table_filter_input(
+        &mut self,
+        value: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_filter_input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+        });
     }
 
     pub(crate) fn open_table_filter_editor(
@@ -995,10 +1023,21 @@ mod performance_tests {
                 workspace.table_sidebar_visible = false;
                 workspace.query_dock_tab = super::QueryDockTab::Results;
                 workspace.query_result = Some(Arc::new(QueryResult {
-                    columns: vec!["id".into(), "name".into(), "active".into()],
-                    column_types: vec!["int4".into(), "text".into(), "bool".into()],
-                    rows: vec![vec!["1".into(), "Alice".into(), "true".into()]],
-                    null_cells: vec![vec![false; 3]],
+                    columns: vec!["id".into(), "name".into(), "active".into(), "state".into()],
+                    column_types: vec!["int4".into(), "text".into(), "bool".into(), "mood".into()],
+                    column_enum_values: vec![
+                        None,
+                        None,
+                        None,
+                        Some(vec!["draft".into(), "in review".into(), "ready".into()]),
+                    ],
+                    rows: vec![vec![
+                        "1".into(),
+                        "Alice".into(),
+                        "true".into(),
+                        "ready".into(),
+                    ]],
+                    null_cells: vec![vec![false; 4]],
                     offset: 0,
                     limit: 25,
                     has_next: false,
@@ -1024,6 +1063,26 @@ mod performance_tests {
             window.press("escape", cx);
             assert!(workspace.read(cx).active_cell_edit().is_none());
 
+            workspace.update(cx, |workspace, cx| {
+                workspace.begin_table_cell_edit(0, 3, window, cx);
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("enum-cell-editor-0-3").is_some());
+            let enum_edit = workspace.read(cx).active_cell_edit().unwrap();
+            assert_eq!(enum_edit.enum_value.as_deref(), Some("ready"));
+            assert_eq!(enum_edit.enum_values.as_deref().unwrap().len(), 3);
+            workspace.update(cx, |workspace, cx| {
+                workspace.select_table_cell_enum_value("in review".into(), window, cx);
+            });
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .active_cell_edit()
+                    .and_then(|edit| edit.enum_value),
+                Some("in review".into())
+            );
+            workspace.update(cx, |workspace, cx| workspace.cancel_table_cell_edit(cx));
+
             window.click("filter-column-1", cx);
             window.render_frame(cx);
             assert!(window.try_find("apply-column-filter-1").is_some());
@@ -1038,14 +1097,26 @@ mod performance_tests {
             });
             window.render_frame(cx);
             window.click("apply-column-filter-1", cx);
+
+            window.click("filter-column-3", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("enum-filter-values-3").is_some());
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_table_filter_input("ready".into(), window, cx);
+            });
+            window.render_frame(cx);
+            window.click("apply-column-filter-3", cx);
         })
         .unwrap();
         cx.update(|cx| {
             let filters = workspace.read(cx).table_column_filters();
-            assert_eq!(filters.len(), 1);
+            assert_eq!(filters.len(), 2);
             assert_eq!(filters[0].column, "name");
             assert_eq!(filters[0].operator, TableFilterOperator::Contains);
             assert_eq!(filters[0].value.as_deref(), Some("Alice"));
+            assert_eq!(filters[1].column, "state");
+            assert_eq!(filters[1].operator, TableFilterOperator::Equals);
+            assert_eq!(filters[1].value.as_deref(), Some("ready"));
         });
     }
 
@@ -1108,6 +1179,7 @@ mod performance_tests {
                         .map(|index| format!("column_{index:02}"))
                         .collect(),
                     column_types: vec!["text".into(); RESULT_COLUMNS],
+                    column_enum_values: vec![None; RESULT_COLUMNS],
                     rows: (0..RESULT_ROWS)
                         .map(|row| {
                             (0..RESULT_COLUMNS)

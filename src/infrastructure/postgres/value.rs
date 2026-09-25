@@ -3,8 +3,31 @@ use std::fmt::Write as _;
 use crate::infrastructure::error::DatabaseError;
 use tokio_postgres::{
     Row,
-    types::{FromSql, Type},
+    types::{FromSql, Kind, Type},
 };
+
+pub(super) fn enum_values(column_type: &Type) -> Option<&[String]> {
+    match column_type.kind() {
+        Kind::Enum(values) => Some(values),
+        Kind::Domain(base_type) => enum_values(base_type),
+        _ => None,
+    }
+}
+
+struct EnumText(String);
+
+impl<'a> FromSql<'a> for EnumText {
+    fn from_sql(
+        _column_type: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(Self(std::str::from_utf8(raw)?.to_owned()))
+    }
+
+    fn accepts(column_type: &Type) -> bool {
+        enum_values(column_type).is_some()
+    }
+}
 
 #[cfg(test)]
 pub(super) fn cell_to_string(
@@ -21,6 +44,13 @@ pub(super) fn cell_to_string_with_null(
     max_bytes: usize,
 ) -> Result<(String, bool), DatabaseError> {
     let column_type = row.columns()[index].type_();
+    if enum_values(column_type).is_some() {
+        return match row.try_get::<_, Option<EnumText>>(index) {
+            Ok(Some(value)) => copy_bounded(&value.0, max_bytes).map(|value| (value, false)),
+            Ok(None) => copy_bounded("NULL", max_bytes).map(|value| (value, true)),
+            Err(_) => fallback_value(column_type.name(), max_bytes).map(|value| (value, false)),
+        };
+    }
     if <&str as FromSql>::accepts(column_type) {
         let Ok(value) = row.try_get::<_, Option<&str>>(index) else {
             return fallback_value(column_type.name(), max_bytes).map(|value| (value, false));
@@ -184,7 +214,8 @@ pub(super) fn cell_to_string_probe_chain(
 
 #[cfg(test)]
 mod tests {
-    use super::{bytea_to_hex, check_size};
+    use super::{EnumText, bytea_to_hex, check_size, enum_values};
+    use tokio_postgres::types::{FromSql, Kind, Type};
 
     #[test]
     fn hex_encodes_bytes_without_changing_lowercase_output() {
@@ -195,5 +226,35 @@ mod tests {
     fn rejects_values_over_the_remaining_result_budget() {
         assert!(check_size(3, 4).is_ok());
         assert!(check_size(5, 4).is_err());
+    }
+
+    #[test]
+    fn reads_enum_labels_and_enum_text_from_postgres_type_metadata() {
+        let labels = vec![
+            "draft".to_owned(),
+            "in review".to_owned(),
+            "ready".to_owned(),
+        ];
+        let enum_type = Type::new(
+            "mood".into(),
+            90_001,
+            Kind::Enum(labels.clone()),
+            "public".into(),
+        );
+        assert_eq!(enum_values(&enum_type), Some(labels.as_slice()));
+        assert!(EnumText::accepts(&enum_type));
+        assert_eq!(
+            EnumText::from_sql(&enum_type, b"in review").unwrap().0,
+            "in review"
+        );
+
+        let domain_type = Type::new(
+            "mood_domain".into(),
+            90_002,
+            Kind::Domain(enum_type),
+            "public".into(),
+        );
+        assert_eq!(enum_values(&domain_type), Some(labels.as_slice()));
+        assert!(EnumText::accepts(&domain_type));
     }
 }
