@@ -5,6 +5,7 @@ pub struct QueryResult {
     pub column_enum_values: Vec<Option<Vec<String>>>,
     pub rows: Vec<Vec<String>>,
     pub null_cells: Vec<Vec<bool>>,
+    pub truncated_cells: Vec<Vec<bool>>,
     pub offset: usize,
     pub limit: usize,
     pub has_next: bool,

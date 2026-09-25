@@ -136,6 +136,15 @@ pub(crate) fn begin_table_cell_edit(
     let Some(result) = workspace.query_result.as_ref() else {
         return;
     };
+    if result
+        .truncated_cells
+        .get(row_index)
+        .and_then(|cells| cells.get(column_index))
+        .copied()
+        .unwrap_or(false)
+    {
+        return;
+    }
     let Some(table) = result.editable.as_ref() else {
         return;
     };
@@ -226,6 +235,7 @@ pub(crate) fn is_inline_edit_type(type_name: Option<&str>) -> bool {
                 | "float4"
                 | "float8"
                 | "numeric"
+                | "jsonb"
                 | "date"
                 | "time"
                 | "timetz"

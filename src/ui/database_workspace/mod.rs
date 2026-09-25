@@ -992,6 +992,8 @@ mod performance_tests {
 
     #[gpui_kit::test]
     fn table_grid_supports_inline_edit_and_column_filter_controls(cx: &mut TestAppContext) {
+        assert!(super::is_inline_edit_type(Some("numeric")));
+        assert!(super::is_inline_edit_type(Some("jsonb")));
         cx.update(|cx| {
             gpui_kit::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
@@ -1038,6 +1040,7 @@ mod performance_tests {
                         "ready".into(),
                     ]],
                     null_cells: vec![vec![false; 4]],
+                    truncated_cells: vec![vec![false; 4]],
                     offset: 0,
                     limit: 25,
                     has_next: false,
@@ -1195,6 +1198,7 @@ mod performance_tests {
                         })
                         .collect(),
                     null_cells: vec![vec![false; RESULT_COLUMNS]; RESULT_ROWS],
+                    truncated_cells: vec![vec![false; RESULT_COLUMNS]; RESULT_ROWS],
                     offset: 0,
                     limit: RESULT_ROWS,
                     has_next: false,

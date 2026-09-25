@@ -1617,9 +1617,17 @@ fn render_result_row(
         #[cfg(test)]
         RESULT_CELL_RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
         let visible_prefix = visible_cell_prefix(cell);
-        let visible_cell_value = visible_prefix
-            .map(|prefix| gpui_kit::SharedString::new(format!("{prefix}…")))
-            .unwrap_or_else(|| gpui_kit::SharedString::new(cell));
+        let cell_truncated = result
+            .truncated_cells
+            .get(source_row_index)
+            .and_then(|cells| cells.get(*column_index))
+            .copied()
+            .unwrap_or(false);
+        let visible_cell_value = match visible_prefix {
+            Some(prefix) => gpui_kit::SharedString::new(format!("{prefix}…")),
+            None if cell_truncated => gpui_kit::SharedString::new(format!("{cell}…")),
+            None => gpui_kit::SharedString::new(cell),
+        };
         let column_type = result
             .column_types
             .get(*column_index)
@@ -1755,26 +1763,34 @@ fn render_result_row(
                 });
             }
         }
-        Some(if visible_prefix.is_some() && editing.is_none() {
+        Some(if (visible_prefix.is_some() || cell_truncated) && editing.is_none() {
             let eager_tooltip_value =
-                eager_cell_tooltips.then(|| gpui_kit::SharedString::new(cell));
+                eager_cell_tooltips.then(|| cell.to_owned());
             let tooltip_workspace = workspace.clone();
             let tooltip_row_index = source_row_index;
             let tooltip_column_index = *column_index;
+            let tooltip_is_truncated = cell_truncated;
             cell_element
                 .tooltip(move |window, cx| {
                     // Large cell values are owned only when a tooltip is actually requested.
-                    let tooltip_value = eager_tooltip_value.clone().unwrap_or_else(|| {
+                    let mut tooltip_value = eager_tooltip_value.clone().unwrap_or_else(|| {
                         tooltip_workspace
                             .read(cx)
                             .query_result()
                             .and_then(|result| {
                                 result_cell_value(result, tooltip_row_index, tooltip_column_index)
-                            })
-                            .map(gpui_kit::SharedString::new)
+                            }).map(str::to_owned)
                             .unwrap_or_default()
                     });
-                    gpui_kit::component::tooltip::Tooltip::new(tooltip_value).build(window, cx)
+                    if tooltip_is_truncated {
+                        tooltip_value.push_str(
+                            "\n\n[Preview shortened to fit display limits; this cell is read-only.]",
+                        );
+                    }
+                    gpui_kit::component::tooltip::Tooltip::new(
+                        gpui_kit::SharedString::new(tooltip_value),
+                    )
+                    .build(window, cx)
                 })
                 .into_any_element()
         } else {
@@ -1884,6 +1900,15 @@ fn is_inline_editable_cell(result: &QueryResult, row_index: usize, column_index:
     let Some(column) = result.columns.get(column_index) else {
         return false;
     };
+    if result
+        .truncated_cells
+        .get(row_index)
+        .and_then(|cells| cells.get(column_index))
+        .copied()
+        .unwrap_or(false)
+    {
+        return false;
+    }
     !table.primary_key_columns.is_empty()
         && !table.primary_key_columns.iter().any(|key| key == column)
         && result
@@ -2054,10 +2079,10 @@ pub(crate) fn matching_row_indices_with_cancellation(
 mod tests {
     use super::{
         AsciiCaseInsensitiveMatcher, TABLE_CELL_PREVIEW_CHARS, contains_ascii_case_insensitive,
-        matching_row_indices, matching_row_indices_with_cancellation, result_cell_value,
-        table_column_width, visible_cell_prefix,
+        is_inline_editable_cell, matching_row_indices, matching_row_indices_with_cancellation,
+        result_cell_value, table_column_width, visible_cell_prefix,
     };
-    use crate::domain::query::QueryResult;
+    use crate::domain::query::{EditableTable, QueryResult};
 
     #[test]
     fn matches_ascii_without_allocating_a_lowercased_copy() {
@@ -2138,6 +2163,7 @@ mod tests {
             column_enum_values: vec![None],
             rows: vec![vec![value.clone()]],
             null_cells: vec![vec![false]],
+            truncated_cells: vec![vec![false]],
             offset: 0,
             limit: 1,
             has_next: false,
@@ -2147,6 +2173,31 @@ mod tests {
 
         assert_eq!(result_cell_value(&result, 0, 0), Some(value.as_str()));
         assert_eq!(result_cell_value(&result, 1, 0), None);
+    }
+
+    #[test]
+    fn truncated_result_cells_are_not_inline_editable() {
+        let mut result = QueryResult {
+            columns: vec!["payload".into()],
+            column_types: vec!["jsonb".into()],
+            column_enum_values: vec![None],
+            rows: vec![vec!["{\"partial\":".into()]],
+            null_cells: vec![vec![false]],
+            truncated_cells: vec![vec![false]],
+            offset: 0,
+            limit: 1,
+            has_next: false,
+            truncated: false,
+            editable: Some(EditableTable {
+                schema: "public".into(),
+                table: "documents".into(),
+                primary_key_columns: vec!["id".into()],
+            }),
+        };
+
+        assert!(is_inline_editable_cell(&result, 0, 0));
+        result.truncated_cells[0][0] = true;
+        assert!(!is_inline_editable_cell(&result, 0, 0));
     }
 
     #[test]
@@ -2168,6 +2219,7 @@ mod tests {
             column_enum_values: vec![None],
             rows: vec![vec!["first".into()], vec!["second".into()]],
             null_cells: vec![vec![false], vec![false]],
+            truncated_cells: vec![vec![false], vec![false]],
             offset: 0,
             limit: 2,
             has_next: false,
@@ -2197,6 +2249,7 @@ mod tests {
             column_enum_values: vec![None],
             rows: vec![vec!["first".into()], vec!["second".into()]],
             null_cells: vec![vec![false], vec![false]],
+            truncated_cells: vec![vec![false], vec![false]],
             offset: 0,
             limit: 2,
             has_next: false,

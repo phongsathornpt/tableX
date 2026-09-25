@@ -38,6 +38,13 @@ const TABLE_PRIMARY_KEY_QUERY: &str = "SELECT a.attname
 struct DecodedRows {
     rows: Vec<Vec<String>>,
     null_cells: Vec<Vec<bool>>,
+    truncated_cells: Vec<Vec<bool>>,
+}
+
+struct DecodedRow {
+    values: Vec<String>,
+    null_cells: Vec<bool>,
+    truncated_cells: Vec<bool>,
 }
 
 impl DecodedRows {
@@ -48,11 +55,13 @@ impl DecodedRows {
     fn truncate(&mut self, len: usize) {
         self.rows.truncate(len);
         self.null_cells.truncate(len);
+        self.truncated_cells.truncate(len);
     }
 
     fn reverse(&mut self) {
         self.rows.reverse();
         self.null_cells.reverse();
+        self.truncated_cells.reverse();
     }
 }
 
@@ -567,6 +576,7 @@ async fn execute_query_client(
     let decoded_rows = async {
         let mut rows = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
         let mut null_cells = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
+        let mut truncated_cells = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
         let mut total_bytes = 0usize;
         let mut truncated = false;
         while let Some(row) = row_stream
@@ -579,11 +589,12 @@ async fn execute_query_client(
                 continue;
             }
 
-            let (values, nulls) = decode_row(&row, columns.len(), &mut total_bytes)?;
-            rows.push(values);
-            null_cells.push(nulls);
+            let decoded = decode_row(&row, columns.len(), &mut total_bytes)?;
+            rows.push(decoded.values);
+            null_cells.push(decoded.null_cells);
+            truncated_cells.push(decoded.truncated_cells);
         }
-        Ok::<_, DatabaseError>((rows, null_cells, truncated))
+        Ok::<_, DatabaseError>((rows, null_cells, truncated_cells, truncated))
     }
     .await;
     drop(row_stream);
@@ -593,7 +604,7 @@ async fn execute_query_client(
             "could not close read-only query transaction: {error}"
         ))
     })?;
-    let (rows, null_cells, truncated) = decoded_rows?;
+    let (rows, null_cells, truncated_cells, truncated) = decoded_rows?;
 
     Ok(QueryResult {
         columns,
@@ -601,6 +612,7 @@ async fn execute_query_client(
         column_enum_values,
         offset: 0,
         null_cells,
+        truncated_cells,
         limit: MAX_QUERY_ROWS,
         has_next: truncated,
         rows,
@@ -849,12 +861,14 @@ async fn execute_table_preview_client(
         rows.reverse();
     }
     let null_cells = rows.null_cells;
+    let truncated_cells = rows.truncated_cells;
     let rows = rows.rows;
     Ok(QueryResult {
         columns,
         column_types,
         column_enum_values,
         null_cells,
+        truncated_cells,
         offset: usize::try_from(offset).expect("the offset was validated before execution"),
         limit,
         has_next,
@@ -1131,6 +1145,7 @@ async fn read_preview_rows_with_parameters(
     let mut rows = DecodedRows {
         rows: Vec::with_capacity(limit + 1),
         null_cells: Vec::with_capacity(limit + 1),
+        truncated_cells: Vec::with_capacity(limit + 1),
     };
     let mut decode_error = None;
     while let Some(row) = row_stream
@@ -1140,9 +1155,10 @@ async fn read_preview_rows_with_parameters(
     {
         if decode_error.is_none() {
             match decode_row(&row, column_count, &mut total_bytes) {
-                Ok((values, null_cells)) => {
-                    rows.rows.push(values);
-                    rows.null_cells.push(null_cells);
+                Ok(decoded) => {
+                    rows.rows.push(decoded.values);
+                    rows.null_cells.push(decoded.null_cells);
+                    rows.truncated_cells.push(decoded.truncated_cells);
                 }
                 Err(error) => decode_error = Some(error),
             }
@@ -1158,18 +1174,29 @@ fn decode_row(
     row: &tokio_postgres::Row,
     column_count: usize,
     total_bytes: &mut usize,
-) -> Result<(Vec<String>, Vec<bool>), DatabaseError> {
+) -> Result<DecodedRow, DatabaseError> {
     let mut cells = Vec::with_capacity(column_count);
     let mut null_cells = Vec::with_capacity(column_count);
+    let mut truncated_cells = Vec::with_capacity(column_count);
     for index in 0..column_count {
         let remaining = MAX_QUERY_RESULT_BYTES.saturating_sub(*total_bytes);
-        let (cell, is_null) =
-            cell_to_string_with_null(row, index, MAX_QUERY_CELL_BYTES.min(remaining))?;
+        let mut is_truncated = false;
+        let (cell, is_null) = cell_to_string_with_null(
+            row,
+            index,
+            MAX_QUERY_CELL_BYTES.min(remaining),
+            &mut is_truncated,
+        )?;
         *total_bytes += cell.len();
         cells.push(cell);
         null_cells.push(is_null);
+        truncated_cells.push(is_truncated);
     }
-    Ok((cells, null_cells))
+    Ok(DecodedRow {
+        values: cells,
+        null_cells,
+        truncated_cells,
+    })
 }
 
 #[cfg(test)]
