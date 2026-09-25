@@ -1,3 +1,4 @@
+use super::connection_editor::missing_required_fields_message;
 use super::{ConnectionEditor, DatabaseWorkspace};
 use crate::domain::connection::ConnectionSummary;
 use crate::infrastructure::postgres::model::PostgresConnectionProfile;
@@ -158,11 +159,8 @@ pub(crate) fn save(workspace: &mut DatabaseWorkspace, cx: &mut Context<DatabaseW
         }
     };
 
-    if name.is_empty() || host.is_empty() || database.is_empty() || user.is_empty() {
-        workspace.notice = Some(Notice::error(
-            "Missing connection details",
-            "Name, host, database, and user are required.",
-        ));
+    if let Some(message) = missing_required_fields_message(&name, &host, &database, &user) {
+        workspace.notice = Some(Notice::error("Missing connection details", message));
         cx.notify();
         return;
     }

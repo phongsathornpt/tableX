@@ -13,6 +13,40 @@ use super::{DatabaseWorkspace, ssl_description, ssl_label, ssl_menu_item};
 use crate::domain::connection::ConnectionId;
 use crate::infrastructure::postgres::model::{PostgresConnectionProfile, PostgresSslMode};
 
+pub(crate) fn missing_required_fields_message(
+    name: &str,
+    host: &str,
+    database: &str,
+    user: &str,
+) -> Option<String> {
+    let missing = [
+        ("Name", name),
+        ("host", host),
+        ("database", database),
+        ("user", user),
+    ]
+    .into_iter()
+    .filter_map(|(label, value)| value.is_empty().then_some(label))
+    .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let fields = match missing.as_slice() {
+        [only] => (*only).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        many => format!(
+            "{}, and {}",
+            many[..many.len() - 1].join(", "),
+            many[many.len() - 1]
+        ),
+    };
+    Some(format!(
+        "{fields} {} required",
+        if missing.len() == 1 { "is" } else { "are" }
+    ))
+}
+
 pub(crate) struct ConnectionEditor {
     pub(crate) editing_id: Option<ConnectionId>,
     pub(crate) name: gpui_kit::Entity<InputState>,
@@ -100,8 +134,8 @@ impl ConnectionEditor {
         let Some(port) = port.filter(|port| *port > 0) else {
             return Err("Port must be a number between 1 and 65535".into());
         };
-        if name.is_empty() || host.is_empty() || database.is_empty() || user.is_empty() {
-            return Err("Name, host, database, and user are required".into());
+        if let Some(message) = missing_required_fields_message(&name, &host, &database, &user) {
+            return Err(message);
         }
         if self.ssl == PostgresSslMode::Require && !self.reject_unauthorized {
             return Err(

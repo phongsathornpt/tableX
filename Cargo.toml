@@ -3,6 +3,10 @@ name = "tableX"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tablex"
+path = "src/lib.rs"
+
 [dependencies]
 gpui-kit = "0.6.6"
 chrono = { version = "0.4", default-features = false, features = ["std"] }

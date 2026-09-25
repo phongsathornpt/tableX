@@ -45,6 +45,75 @@ pub fn render(cx: &mut Context<DatabaseWorkspace>, view: HomepageView<'_>) -> im
         "●  Not connected".to_string()
     };
 
+    let connection_content = if let Some(editor) = view.connection_editor {
+        editor
+            .render(view.connection_test_running, cx)
+            .into_any_element()
+    } else {
+        connections::render(
+            cx,
+            view.connections,
+            view.selected_connection,
+            view.connected,
+            view.pending_delete,
+        )
+        .into_any_element()
+    };
+
+    let mut workspace = v_flex()
+        .w(px(860.))
+        .gap_6()
+        .child(
+            v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_2xl()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(cx.theme().primary)
+                        .child("Database connections"),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Connect to a PostgreSQL server to browse and query your data."),
+                ),
+        )
+        .child(connection_content);
+    if view.connected {
+        workspace = workspace.child(query::render_panel(
+            cx,
+            view.query_input,
+            view.query_running,
+            view.write_confirmation_pending,
+        ));
+        workspace = workspace.child(query::render_result(
+            cx,
+            view.query_result,
+            0,
+            500,
+            false,
+            view.query_running,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            HashSet::new(),
+            None,
+            None,
+            false,
+            &[],
+            None,
+            None,
+        ));
+    } else if view.connection_editor.is_none() {
+        workspace = workspace.child(empty::recent(cx));
+    }
+
     v_flex()
         .size_full()
         .bg(cx.theme().background)
@@ -55,84 +124,19 @@ pub fn render(cx: &mut Context<DatabaseWorkspace>, view: HomepageView<'_>) -> im
             div().into_any_element()
         })
         .child(
-            v_flex().flex_1().items_center().justify_center().child(
-                v_flex()
-                    .w(px(860.))
-                    .gap_6()
-                    .child(
-                        v_flex()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_2xl()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(cx.theme().primary)
-                                    .child("Database connections"),
-                            )
-                            .child(
-                                div().text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Connect to a PostgreSQL server to browse and query your data."),
-                            ),
-                    )
-                    .child(if let Some(editor) = view.connection_editor {
-                        editor.render(view.connection_test_running, cx).into_any_element()
-                    } else {
-                        connections::render(
-                            cx,
-                            view.connections,
-                            view.selected_connection,
-                            view.connected,
-                            view.pending_delete,
-                        )
-                        .into_any_element()
-                    })
-                    .child(if view.connected {
-                        query::render_panel(
-                            cx,
-                            view.query_input,
-                            view.query_running,
-                            view.write_confirmation_pending,
-                        )
-                        .into_any_element()
-                    } else {
-                        empty::actions(cx).into_any_element()
-                    })
-                    .child(if view.connected {
-                        query::render_result(
-                            cx,
-                            view.query_result,
-                            0,
-                            500,
-                            false,
-                            view.query_running,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            false,
-                            HashSet::new(),
-                            None,
-                            None,
-                            false,
-                            &[],
-                            None,
-                            None,
-                        )
-                            .into_any_element()
-                    } else {
-                        empty::recent(cx).into_any_element()
-                    }),
-            ),
+            v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(workspace),
         )
         .child(
-            StatusBar::new()
-                .left(status)
-                .right(view.server_version.map_or("PostgreSQL".to_string(), |version| {
-                    format!("PostgreSQL {version}")
-                })),
+            StatusBar::new().left(status).right(
+                view.server_version
+                    .map_or("PostgreSQL".to_string(), |version| {
+                        format!("PostgreSQL {version}")
+                    }),
+            ),
         )
 }
 
@@ -321,45 +325,5 @@ pub fn render_workspace(
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::domain::query::EditableTable;
-    use crate::infrastructure::postgres::sql::{build_delete_sql, build_update_sql};
-
-    #[test]
-    fn generates_reviewable_update_with_escaped_values() {
-        let table = EditableTable {
-            schema: "public".into(),
-            table: "people".into(),
-            primary_key_columns: vec!["id".into()],
-        };
-        let sql = build_update_sql(
-            &table,
-            &["id".into(), "name".into()],
-            &["7".into(), "O'Reilly".into()],
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "UPDATE \"public\".\"people\" SET \"name\" = 'O''Reilly' WHERE \"id\" = '7';"
-        );
-    }
-
-    #[test]
-    fn generates_delete_with_composite_key_and_null_literal() {
-        let table = EditableTable {
-            schema: "sales".into(),
-            table: "line_items".into(),
-            primary_key_columns: vec!["order_id".into(), "line_id".into()],
-        };
-        let sql = build_delete_sql(
-            &table,
-            &["order_id".into(), "line_id".into(), "label".into()],
-            &["9".into(), "NULL".into(), "item".into()],
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            "DELETE FROM \"sales\".\"line_items\" WHERE \"order_id\" = '9' AND \"line_id\" IS NULL;"
-        );
-    }
-}
+#[path = "../../tests/unit/ui/home.rs"]
+mod tests;

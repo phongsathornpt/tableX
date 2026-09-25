@@ -1,0 +1,665 @@
+use super::*;
+
+pub(crate) fn preview_table_page(
+    provider: &PostgresProvider,
+    profile: PostgresConnectionProfile,
+    schema: String,
+    table: String,
+    request: TablePreviewPageRequest,
+) -> Result<QueryResult, DatabaseError> {
+    let TablePreviewPageRequest {
+        limit,
+        offset,
+        sort,
+        primary_key_columns,
+        cursor,
+        filters,
+    } = request;
+    let limit = limit.clamp(1, 100);
+    let offset_for_query = i64::try_from(offset)
+        .map_err(|_| DatabaseError::new("table preview offset exceeds PostgreSQL limits"))?;
+    let select_sql = preview_select_sql(&schema, &table, sort.as_ref(), &primary_key_columns);
+    let relation = format!("{}.{}", quote_identifier(&schema), quote_identifier(&table));
+    validate_read(&select_sql)?;
+    let profile_for_task = profile;
+    let sessions = &provider.metadata_sessions;
+    runtime::run(move || {
+        preview_table_page_on_runtime(
+            sessions,
+            &profile_for_task,
+            &select_sql,
+            &relation,
+            schema,
+            table,
+            limit,
+            offset_for_query,
+            primary_key_columns,
+            sort,
+            cursor,
+            filters,
+        )
+    })
+}
+
+pub(super) fn preview_select_sql(
+    schema: &str,
+    table: &str,
+    sort: Option<&(String, bool)>,
+    primary_key_columns: &[String],
+) -> String {
+    let relation = format!("{}.{}", quote_identifier(schema), quote_identifier(table));
+    let order_sql = sort.map_or_else(String::new, |(column, descending)| {
+        let direction = if *descending { "DESC" } else { "ASC" };
+        let order_columns = if primary_key_columns.first() == Some(column) {
+            primary_key_columns
+        } else {
+            std::slice::from_ref(column)
+        };
+        let columns = order_columns
+            .iter()
+            .map(|column| format!("{} {direction}", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ORDER BY {columns}")
+    });
+    format!("SELECT * FROM {relation}{order_sql} LIMIT $1::bigint OFFSET $2::bigint")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_table_page_on_runtime(
+    sessions: &MetadataSessionCache,
+    profile: &PostgresConnectionProfile,
+    sql: &str,
+    relation: &str,
+    schema: String,
+    table: String,
+    limit: usize,
+    offset: i64,
+    primary_key_columns: Vec<String>,
+    sort: Option<(String, bool)>,
+    page_cursor: Option<TableDataCursor>,
+    filters: Vec<TableColumnFilter>,
+) -> Result<QueryResult, DatabaseError> {
+    let runtime = runtime::handle()?;
+    runtime.block_on(async {
+        for attempt in 0..=1 {
+            let session = sessions.get_or_connect(profile).await?;
+            let (result, is_closed) = {
+                let client = session.client.lock().await;
+                let result = execute_table_preview_client(
+                    &session,
+                    &client,
+                    sql,
+                    relation,
+                    schema.clone(),
+                    table.clone(),
+                    limit,
+                    offset,
+                    &primary_key_columns,
+                    sort.as_ref(),
+                    page_cursor.as_ref(),
+                    &filters,
+                )
+                .await;
+                (result, client.is_closed())
+            };
+            if is_closed {
+                sessions.invalidate_if_current(&session).await;
+                if attempt == 0 {
+                    continue;
+                }
+            }
+            return result;
+        }
+        unreachable!("the bounded preview reconnect loop always returns")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_table_preview_client(
+    session: &MetadataSession,
+    client: &Client,
+    sql: &str,
+    relation: &str,
+    schema: String,
+    table: String,
+    limit: usize,
+    offset: i64,
+    primary_key_columns_hint: &[String],
+    sort: Option<&(String, bool)>,
+    page_cursor: Option<&TableDataCursor>,
+    filters: &[TableColumnFilter],
+) -> Result<QueryResult, DatabaseError> {
+    let key_tiebreaker_was_requested = sort.is_some_and(|(column, _)| {
+        primary_key_columns_hint.first() == Some(column) && primary_key_columns_hint.len() > 1
+    });
+    let preview_statement = async {
+        match session.read_statement(client, sql).await {
+            Ok(statement) => Ok(statement),
+            Err(_) if key_tiebreaker_was_requested => {
+                let fallback_sql = preview_select_sql(&schema, &table, sort, &[]);
+                session.read_statement(client, &fallback_sql).await
+            }
+            Err(error) => Err(error),
+        }
+    };
+    let (base_statement, primary_key_statement) = futures_util::try_join!(
+        preview_statement,
+        session.read_statement(client, TABLE_PRIMARY_KEY_QUERY),
+    )?;
+    let column_type_specs = base_statement
+        .columns()
+        .iter()
+        .map(|column| {
+            (
+                column.name().to_owned(),
+                qualified_type_name(column.type_()),
+                is_text_filter_type(column.type_().name()),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (filter_clause, filter_values) = build_filter_predicates(filters, &column_type_specs)?;
+    let statement = if filters.is_empty() {
+        base_statement
+    } else {
+        let filtered_sql = build_filtered_offset_sql(
+            relation,
+            sort,
+            primary_key_columns_hint,
+            &filter_clause,
+            filter_values.len(),
+        );
+        session.read_statement(client, &filtered_sql).await?
+    };
+    let columns = statement
+        .columns()
+        .iter()
+        .map(|column| column.name().to_owned())
+        .collect::<Vec<_>>();
+    let column_types = statement
+        .columns()
+        .iter()
+        .map(|column| column.type_().name().to_owned())
+        .collect::<Vec<_>>();
+    let column_enum_values = statement
+        .columns()
+        .iter()
+        .map(|column| postgres_enum_values(column.type_()).map(<[String]>::to_vec))
+        .collect::<Vec<_>>();
+    // The normal preview query includes LIMIT limit+1 (limit is capped at 100).
+    // Stream and decode rows as they arrive so a page of wide rows does not keep
+    // both every raw PostgreSQL row and every decoded display value in memory.
+    // The independent primary-key lookup can share a network round trip with
+    // the bounded table-page read on tokio-postgres' pipelined connection.
+    let primary_key_parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&relation];
+    let cursor_candidate = page_cursor
+        .zip(sort)
+        .filter(|_| offset > 0)
+        .filter(|(_, (sort_column, _))| primary_key_columns_hint.first() == Some(sort_column))
+        .filter(|(cursor, _)| cursor.values.len() == primary_key_columns_hint.len());
+    let keyset_statement = if let Some((cursor, (_, descending))) = cursor_candidate {
+        let key_columns = primary_key_columns_hint
+            .iter()
+            .map(|name| {
+                statement
+                    .columns()
+                    .iter()
+                    .find(|column| column.name() == name)
+                    .map(|column| (name.as_str(), qualified_type_name(column.type_())))
+            })
+            .collect::<Option<Vec<_>>>();
+        if let Some(key_columns) = key_columns {
+            let keyset_sql = build_keyset_sql_with_filters(
+                relation,
+                &key_columns,
+                *descending,
+                cursor.direction,
+                &filter_clause,
+                filter_values.len(),
+            );
+            session.read_statement(client, &keyset_sql).await.ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let requested_page_future = async {
+        if let (Some(statement), Some((cursor, _))) = (&keyset_statement, cursor_candidate) {
+            read_preview_rows_after_filtered(
+                client,
+                statement,
+                columns.len(),
+                limit,
+                &filter_values,
+                &cursor.values,
+            )
+            .await
+        } else if filters.is_empty() {
+            read_preview_rows(client, &statement, columns.len(), limit, offset).await
+        } else {
+            read_preview_rows_filtered(
+                client,
+                &statement,
+                columns.len(),
+                limit,
+                offset,
+                &filter_values,
+            )
+            .await
+        }
+    };
+    let (requested_rows, primary_key_result) = futures_util::join!(
+        requested_page_future,
+        client.query(&primary_key_statement, &primary_key_parameters),
+    );
+    let primary_key_columns = primary_key_result
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| row.try_get::<_, String>(0).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    #[cfg(test)]
+    let requested_page_succeeded = requested_rows.is_ok();
+    let (mut rows, used_keyset) = if keyset_statement.is_none() {
+        (requested_rows?, false)
+    } else if primary_key_columns.as_slice() == primary_key_columns_hint {
+        match requested_rows {
+            Ok(rows) => (rows, true),
+            Err(_) => (
+                if filters.is_empty() {
+                    read_preview_rows(client, &statement, columns.len(), limit, offset).await?
+                } else {
+                    read_preview_rows_filtered(
+                        client,
+                        &statement,
+                        columns.len(),
+                        limit,
+                        offset,
+                        &filter_values,
+                    )
+                    .await?
+                },
+                false,
+            ),
+        }
+    } else {
+        (
+            if filters.is_empty() {
+                read_preview_rows(client, &statement, columns.len(), limit, offset).await?
+            } else {
+                read_preview_rows_filtered(
+                    client,
+                    &statement,
+                    columns.len(),
+                    limit,
+                    offset,
+                    &filter_values,
+                )
+                .await?
+            },
+            false,
+        )
+    };
+    let needs_composite_pk_order = !used_keyset
+        && primary_key_columns.len() > 1
+        && sort.is_some_and(|(sort_column, _)| primary_key_columns.first() == Some(sort_column))
+        && primary_key_columns_hint != primary_key_columns;
+    if needs_composite_pk_order {
+        let stable_sql = if filters.is_empty() {
+            preview_select_sql(&schema, &table, sort, &primary_key_columns)
+        } else {
+            build_filtered_offset_sql(
+                relation,
+                sort,
+                &primary_key_columns,
+                &filter_clause,
+                filter_values.len(),
+            )
+        };
+        let stable_statement = session.read_statement(client, &stable_sql).await?;
+        rows = if filters.is_empty() {
+            read_preview_rows(client, &stable_statement, columns.len(), limit, offset).await?
+        } else {
+            read_preview_rows_filtered(
+                client,
+                &stable_statement,
+                columns.len(),
+                limit,
+                offset,
+                &filter_values,
+            )
+            .await?
+        };
+    }
+    #[cfg(test)]
+    if std::env::var_os("TABLEX_TEST_PG_PREVIEW_TRACE").is_some() {
+        eprintln!(
+            "[tableX preview trace] keyset_prepared={}, live_pk_matches_hint={}, requested_succeeded={}, keyset_used={used_keyset}",
+            keyset_statement.is_some(),
+            primary_key_columns.as_slice() == primary_key_columns_hint,
+            requested_page_succeeded,
+        );
+    }
+    let is_previous_page = used_keyset
+        && page_cursor.is_some_and(|cursor| cursor.direction == TableDataCursorDirection::Before);
+    let has_next = if is_previous_page {
+        offset > 0
+    } else {
+        rows.len() > limit
+    };
+    rows.truncate(limit);
+    if is_previous_page {
+        rows.reverse();
+    }
+    let null_cells = rows.null_cells;
+    let truncated_cells = rows.truncated_cells;
+    let rows = rows.rows;
+    Ok(QueryResult {
+        columns,
+        column_types,
+        column_enum_values,
+        null_cells,
+        truncated_cells,
+        offset: usize::try_from(offset).expect("the offset was validated before execution"),
+        limit,
+        has_next,
+        truncated: has_next,
+        rows,
+        editable: Some(EditableTable {
+            schema,
+            table,
+            primary_key_columns,
+        }),
+    })
+}
+
+pub(super) fn qualified_type_name(column_type: &tokio_postgres::types::Type) -> String {
+    let name = quote_identifier(column_type.name());
+    format!("{}.{}", quote_identifier(column_type.schema()), name)
+}
+
+type PreviewColumnType = (String, String, bool);
+
+fn is_text_filter_type(type_name: &str) -> bool {
+    matches!(
+        type_name.to_ascii_lowercase().as_str(),
+        "text" | "varchar" | "bpchar" | "name" | "citext"
+    )
+}
+
+pub(in crate::infrastructure::postgres::query) fn build_filter_predicates(
+    filters: &[TableColumnFilter],
+    columns: &[PreviewColumnType],
+) -> Result<(String, Vec<String>), DatabaseError> {
+    if filters.len() > MAX_TABLE_FILTERS {
+        return Err(DatabaseError::new(format!(
+            "A table preview supports at most {MAX_TABLE_FILTERS} column filters"
+        )));
+    }
+
+    let mut predicates = Vec::with_capacity(filters.len());
+    let mut values = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let Some((_, type_name, is_text)) =
+            columns.iter().find(|(name, _, _)| name == &filter.column)
+        else {
+            return Err(DatabaseError::new(
+                "A filtered column is no longer present; refresh the table",
+            ));
+        };
+        let quoted_column = quote_identifier(&filter.column);
+        match filter.operator {
+            TableFilterOperator::IsNull => {
+                predicates.push(format!("{quoted_column} IS NULL"));
+            }
+            TableFilterOperator::IsNotNull => {
+                predicates.push(format!("{quoted_column} IS NOT NULL"));
+            }
+            operator => {
+                let value = filter.value.as_deref().ok_or_else(|| {
+                    DatabaseError::new("Enter a value for each active column filter")
+                })?;
+                if value.len() > MAX_TABLE_FILTER_VALUE_BYTES {
+                    return Err(DatabaseError::new(format!(
+                        "Column filter values are limited to {MAX_TABLE_FILTER_VALUE_BYTES} bytes"
+                    )));
+                }
+                let parameter = values.len() + 1;
+                match operator {
+                    TableFilterOperator::Contains | TableFilterOperator::StartsWith => {
+                        if !is_text {
+                            return Err(DatabaseError::new(
+                                "Contains and starts-with filters require a text column",
+                            ));
+                        }
+                        let escaped = value
+                            .replace('\\', "\\\\")
+                            .replace('%', "\\%")
+                            .replace('_', "\\_");
+                        let pattern = if operator == TableFilterOperator::Contains {
+                            format!("%{escaped}%")
+                        } else {
+                            format!("{escaped}%")
+                        };
+                        predicates.push(format!(
+                            "{quoted_column}::text ILIKE ${parameter}::text ESCAPE '\\'"
+                        ));
+                        values.push(pattern);
+                    }
+                    TableFilterOperator::Equals
+                    | TableFilterOperator::NotEquals
+                    | TableFilterOperator::GreaterThan
+                    | TableFilterOperator::LessThan => {
+                        let comparison = match operator {
+                            TableFilterOperator::Equals => "=",
+                            TableFilterOperator::NotEquals => "<>",
+                            TableFilterOperator::GreaterThan => ">",
+                            TableFilterOperator::LessThan => "<",
+                            _ => unreachable!(),
+                        };
+                        predicates.push(format!(
+                            "{quoted_column} {comparison} ((${}::text)::{type_name})",
+                            parameter
+                        ));
+                        values.push(value.to_owned());
+                    }
+                    TableFilterOperator::IsNull | TableFilterOperator::IsNotNull => {
+                        unreachable!()
+                    }
+                }
+            }
+        }
+    }
+    Ok((predicates.join(" AND "), values))
+}
+
+fn order_by_sql(sort: Option<&(String, bool)>, primary_key_columns: &[String]) -> String {
+    sort.map_or_else(String::new, |(column, descending)| {
+        let direction = if *descending { "DESC" } else { "ASC" };
+        let order_columns = if primary_key_columns.first() == Some(column) {
+            primary_key_columns
+        } else {
+            std::slice::from_ref(column)
+        };
+        let columns = order_columns
+            .iter()
+            .map(|column| format!("{} {direction}", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" ORDER BY {columns}")
+    })
+}
+
+pub(in crate::infrastructure::postgres::query) fn build_filtered_offset_sql(
+    relation: &str,
+    sort: Option<&(String, bool)>,
+    primary_key_columns: &[String],
+    filter_clause: &str,
+    filter_count: usize,
+) -> String {
+    let limit_parameter = filter_count + 1;
+    let offset_parameter = filter_count + 2;
+    format!(
+        "SELECT * FROM {relation} WHERE {filter_clause}{order} LIMIT ${limit_parameter}::bigint OFFSET ${offset_parameter}::bigint",
+        order = order_by_sql(sort, primary_key_columns),
+    )
+}
+
+#[cfg(test)]
+pub(in crate::infrastructure::postgres::query) fn build_keyset_sql(
+    relation: &str,
+    columns: &[(&str, String)],
+    descending: bool,
+    cursor_direction: TableDataCursorDirection,
+) -> String {
+    build_keyset_sql_with_filters(relation, columns, descending, cursor_direction, "", 0)
+}
+
+pub(in crate::infrastructure::postgres::query) fn build_keyset_sql_with_filters(
+    relation: &str,
+    columns: &[(&str, String)],
+    descending: bool,
+    cursor_direction: TableDataCursorDirection,
+    filter_clause: &str,
+    filter_count: usize,
+) -> String {
+    let comparison = match (descending, cursor_direction) {
+        (false, TableDataCursorDirection::After) | (true, TableDataCursorDirection::Before) => ">",
+        (false, TableDataCursorDirection::Before) | (true, TableDataCursorDirection::After) => "<",
+    };
+    let query_descending = descending != (cursor_direction == TableDataCursorDirection::Before);
+    let order_direction = if query_descending { "DESC" } else { "ASC" };
+    let column_names = columns
+        .iter()
+        .map(|(name, _)| quote_identifier(name))
+        .collect::<Vec<_>>();
+    let parameters = columns
+        .iter()
+        .enumerate()
+        .map(|(index, (_, column_type))| {
+            format!("(${}::text)::{column_type}", filter_count + index + 1)
+        })
+        .collect::<Vec<_>>();
+    let row_expression = |values: &[String]| {
+        if values.len() == 1 {
+            values[0].clone()
+        } else {
+            format!("({})", values.join(", "))
+        }
+    };
+    let left = row_expression(&column_names);
+    let right = row_expression(&parameters);
+    let order_by = column_names
+        .iter()
+        .map(|name| format!("{name} {order_direction}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let limit_parameter = filter_count + columns.len() + 1;
+    let mut predicates = Vec::with_capacity(2);
+    if !filter_clause.is_empty() {
+        predicates.push(filter_clause.to_owned());
+    }
+    predicates.push(format!("{left} {comparison} {right}"));
+    format!(
+        "SELECT * FROM {relation} WHERE {} ORDER BY {order_by} LIMIT ${limit_parameter}::bigint",
+        predicates.join(" AND ")
+    )
+}
+
+async fn read_preview_rows(
+    client: &Client,
+    statement: &tokio_postgres::Statement,
+    column_count: usize,
+    limit: usize,
+    offset: i64,
+) -> Result<DecodedRows, DatabaseError> {
+    let page_size = (limit + 1) as i64;
+    let page_parameters: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&page_size, &offset];
+    read_preview_rows_with_parameters(client, statement, column_count, limit, &page_parameters)
+        .await
+}
+
+async fn read_preview_rows_filtered(
+    client: &Client,
+    statement: &tokio_postgres::Statement,
+    column_count: usize,
+    limit: usize,
+    offset: i64,
+    filter_values: &[String],
+) -> Result<DecodedRows, DatabaseError> {
+    let page_size = (limit + 1) as i64;
+    let mut parameters: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = filter_values
+        .iter()
+        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    parameters.push(&page_size);
+    parameters.push(&offset);
+    read_preview_rows_with_parameters(client, statement, column_count, limit, &parameters).await
+}
+
+async fn read_preview_rows_after_filtered(
+    client: &Client,
+    statement: &tokio_postgres::Statement,
+    column_count: usize,
+    limit: usize,
+    filter_values: &[String],
+    cursor: &[String],
+) -> Result<DecodedRows, DatabaseError> {
+    let page_size = (limit + 1) as i64;
+    let mut parameters: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = filter_values
+        .iter()
+        .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync))
+        .collect();
+    parameters.extend(
+        cursor
+            .iter()
+            .map(|value| value as &(dyn tokio_postgres::types::ToSql + Sync)),
+    );
+    parameters.push(&page_size);
+    read_preview_rows_with_parameters(client, statement, column_count, limit, &parameters).await
+}
+
+async fn read_preview_rows_with_parameters(
+    client: &Client,
+    statement: &tokio_postgres::Statement,
+    column_count: usize,
+    limit: usize,
+    parameters: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<DecodedRows, DatabaseError> {
+    let mut row_stream = Box::pin(
+        client
+            .query_raw(statement, parameters.iter().copied())
+            .await
+            .map_err(|error| DatabaseError::new(format!("table preview failed: {error}")))?,
+    );
+    let mut total_bytes = 0usize;
+    let mut rows = DecodedRows {
+        rows: Vec::with_capacity(limit + 1),
+        null_cells: Vec::with_capacity(limit + 1),
+        truncated_cells: Vec::with_capacity(limit + 1),
+    };
+    let mut decode_error = None;
+    while let Some(row) = row_stream
+        .try_next()
+        .await
+        .map_err(|error| DatabaseError::new(format!("table preview failed: {error}")))?
+    {
+        if decode_error.is_none() {
+            match decode_row(&row, column_count, &mut total_bytes) {
+                Ok(decoded) => {
+                    rows.rows.push(decoded.values);
+                    rows.null_cells.push(decoded.null_cells);
+                    rows.truncated_cells.push(decoded.truncated_cells);
+                }
+                Err(error) => decode_error = Some(error),
+            }
+        }
+    }
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
+    Ok(rows)
+}
