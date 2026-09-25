@@ -1,5 +1,9 @@
-mod mock_provider;
-mod provider;
+mod connection_store;
+mod credential_store;
+mod error;
+pub(crate) mod postgres;
 
-pub use mock_provider::MockDatabaseProvider;
-pub use provider::DatabaseProvider;
+pub use connection_store::ConnectionStore;
+pub use credential_store::CredentialStore;
+pub use error::DatabaseError;
+pub use postgres::{PostgresInspection, PostgresProvider, QueryResult};
