@@ -103,7 +103,7 @@ fn table_grid_supports_inline_edit_and_column_filter_controls(cx: &mut TestAppCo
             workspace.selected_table = Some(("public".into(), "people".into()));
             workspace.table_sidebar_visible = false;
             workspace.query_dock_tab = super::QueryDockTab::Results;
-            workspace.query_result = Some(Arc::new(QueryResult {
+            let result = QueryResult {
                 columns: vec!["id".into(), "name".into(), "active".into(), "state".into()],
                 column_types: vec!["int4".into(), "text".into(), "bool".into(), "mood".into()],
                 column_enum_values: vec![
@@ -129,7 +129,10 @@ fn table_grid_supports_inline_edit_and_column_filter_controls(cx: &mut TestAppCo
                     table: "people".into(),
                     primary_key_columns: vec!["id".into()],
                 }),
-            }));
+            };
+            workspace.result_column_widths =
+                super::super::homepage::query::result_column_widths(&result);
+            workspace.query_result = Some(Arc::new(result));
             cx.notify();
         });
     });

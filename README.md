@@ -42,7 +42,7 @@ before building. Run the app with `cargo run` or use `make run`.
 
 ## Releases
 
-Push a version tag matching `Cargo.toml`, for example `v0.1.0`, to run
+Push a version tag matching `Cargo.toml`, for example `v0.0.1`, to run
 `.github/workflows/release.yml`. The workflow runs formatting, checking,
 Clippy, and unit tests, then packages macOS Apple Silicon, macOS Intel, and
 Linux x86_64 builds. It publishes `.dmg`, `.deb`, installer archives, and

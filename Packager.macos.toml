@@ -1,5 +1,5 @@
 product-name = "tableX"
-version = "0.1.0"
+version = "0.0.1"
 identifier = "io.tablex.app"
 description = "A desktop PostgreSQL database management application"
 binaries = [{ path = "tableX", main = true }]

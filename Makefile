@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt fmt-check check clippy test test-postgres build build-release run verify clean
+.PHONY: help fmt fmt-check check clippy test test-postgres build build-release run verify tag clean
 
 help:
 	@printf '%s\n' \
@@ -15,6 +15,7 @@ help:
 		'  make build-release  Build the optimized release application' \
 		'  make run        Run the desktop application' \
 		'  make verify     Run formatting, checks, and tests' \
+		'  make tag        Create an annotated v<package version> Git tag locally' \
 		'  make clean      Remove Cargo build artifacts'
 
 fmt:
@@ -52,6 +53,15 @@ run:
 	cargo run
 
 verify: fmt-check check clippy test
+
+tag:
+	@version="$$(awk -F '"' '/^\[package\]$$/ { in_package=1; next } /^\[/ { in_package=0 } in_package && /^version = / { print $$2; exit }' Cargo.toml)"; \
+	test -n "$$version" || { echo 'Could not read package version from Cargo.toml' >&2; exit 1; }; \
+	tag="v$$version"; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+		echo "Tag $$tag already exists" >&2; exit 1; \
+	fi; \
+	git tag -a "$$tag" -m "tableX $$tag"
 
 clean:
 	cargo clean
