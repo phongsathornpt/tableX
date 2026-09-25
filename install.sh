@@ -1,14 +1,8 @@
 #!/bin/sh
 set -eu
 
-# Replace OWNER/tableX with this repository's actual GitHub slug before the
-# first release, or set TABLEX_REPO when invoking the installer.
-repository=${TABLEX_REPO:-OWNER/tableX}
-
-if [ "$repository" = "OWNER/tableX" ]; then
-  echo "Set TABLEX_REPO to the GitHub owner/repository before using this installer" >&2
-  exit 1
-fi
+# Set TABLEX_REPO when installing from a fork or a different release repository.
+repository=${TABLEX_REPO:-phongsathornpt/tableX}
 case "$repository" in
   */*) ;;
   *) echo "TABLEX_REPO must be in OWNER/REPOSITORY form" >&2; exit 1 ;;
