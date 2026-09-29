@@ -27,12 +27,14 @@ const TABLE_CELL_PREVIEW_CHARS: usize = 160;
 mod result_grid;
 
 #[cfg(test)]
-pub(crate) use result_grid::visible_column_window;
-#[cfg(test)]
-use result_grid::{
-    is_inline_editable_cell, result_cell_value, table_column_width, visible_cell_prefix,
+pub(crate) use result_grid::{
+    flatten_cell_preview, is_mono_column_type, visible_column_window,
+    visible_column_window_with_pinned,
 };
-pub(crate) use result_grid::{render_result, result_column_widths};
+#[cfg(test)]
+use result_grid::{is_inline_editable_cell, result_cell_value, visible_cell_prefix};
+#[allow(unused_imports)]
+pub(crate) use result_grid::{render_result, result_column_widths, table_column_width};
 
 fn table_filter_operators(column_type: &str) -> Vec<(TableFilterOperator, &'static str)> {
     let mut operators = vec![
@@ -271,6 +273,13 @@ pub(crate) fn render_workspace_dock(
                         ),
                 )
                 .child(
+                    div()
+                        .w(px(32.))
+                        .h(px(4.))
+                        .rounded_full()
+                        .bg(cx.theme().border),
+                )
+                .child(
                     h_flex()
                         .items_center()
                         .gap_2()
@@ -331,6 +340,16 @@ pub(crate) fn render_workspace_dock(
                                     write_workspace
                                         .update(cx, |this, cx| this.execute_write_query(cx));
                                 }),
+                        )
+                        .child(
+                            Button::new("collapse-query-dock")
+                                .ghost()
+                                .xsmall()
+                                .icon(Icon::new(gpui_kit::assets::IconName::PanelBottomClose))
+                                .tooltip("Hide SQL Console")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_sql_console(window, cx);
+                                })),
                         ),
                 ),
         )

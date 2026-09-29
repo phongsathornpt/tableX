@@ -17,15 +17,24 @@ pub(crate) fn render(cx: &mut Context<DatabaseWorkspace>, notice: &Notice) -> im
 
     v_flex()
         .absolute()
-        .top(px(16.))
+        .top(px(64.))
         .right(px(20.))
         .w(px(460.))
-        .gap_2()
+        .bg(cx.theme().secondary)
+        .border_1()
+        .border_color(cx.theme().border)
+        .rounded_lg()
+        .shadow_lg()
+        .overflow_hidden()
         .child(alert)
         .when_some(notice.detail.clone(), |this, detail| {
             this.child(
                 div()
                     .px_4()
+                    .pb_3()
+                    .pt_1()
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.5))
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(detail),

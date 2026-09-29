@@ -8,8 +8,12 @@ pub(crate) use titlebar::render as render_titlebar;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, button::Button, input::TextareaState, resizable_panel,
-    status_bar::StatusBar, v_resizable,
+    ActiveTheme as _, Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    input::TextareaState,
+    resizable_panel,
+    status_bar::StatusBar,
+    v_resizable,
 };
 use gpui_kit::{
     Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div, px,
@@ -111,6 +115,11 @@ pub fn render(cx: &mut Context<DatabaseWorkspace>, view: HomepageView<'_>) -> im
             &[],
             None,
             None,
+            false,
+            None,
+            None,
+            &HashSet::new(),
+            None,
         ));
     } else if view.connection_editor.is_none() {
         workspace = workspace.child(empty::recent(cx));
@@ -174,6 +183,11 @@ pub fn render_workspace(
         crate::domain::query::TableFilterOperator,
         Entity<gpui_kit::component::input::InputState>,
     )>,
+    sql_console_expanded: bool,
+    table_preview_loading: bool,
+    table_preview_error: Option<&str>,
+    pinned_columns: &HashSet<String>,
+    custom_column_order: Option<&[String]>,
 ) -> impl IntoElement {
     let relation = selected_table.cloned().or_else(|| {
         query_result
@@ -199,61 +213,68 @@ pub fn render_workspace(
                 .min_h(px(0.))
                 .gap_0()
                 .px_3()
-                .pt_3()
+                .pt_2()
                 .child(
                     h_flex()
-                        .h(px(82.))
+                        .h(px(52.))
                         .justify_between()
                         .items_center()
                         .px_1()
-                        .pb_2()
+                        .pb_1()
                         .border_b_1()
                         .border_color(cx.theme().border)
                         .child(
-                            v_flex().gap_1().child(if let Some((schema, table)) = relation.as_ref() {
+                            v_flex().gap_0p5().child(if let Some((schema, table)) = relation.as_ref() {
                                 h_flex()
                                     .items_center()
-                                    .gap_2()
+                                    .gap_1p5()
                                     .child(
                                         div()
-                                            .text_xl()
+                                            .text_lg()
                                             .font_weight(FontWeight::BOLD)
                                             .text_color(cx.theme().primary)
                                             .child(schema.clone()),
                                     )
-                                    .child(gpui_kit::component::Icon::new(
-                                        gpui_kit::assets::IconName::ChevronRight,
-                                    ))
                                     .child(
                                         div()
-                                            .text_xl()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("›"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_lg()
                                             .font_weight(FontWeight::BOLD)
                                             .child(table.clone()),
                                     )
                                     .into_any_element()
                             } else {
                                 div()
-                                    .text_xl()
+                                    .text_lg()
                                     .font_weight(FontWeight::BOLD)
-                                    .child("Database workspace")
+                                    .child("Database Workspace")
                                     .into_any_element()
                             })
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(relation.as_ref().map_or_else(
                                         || "Browse tables and run safe queries.".to_owned(),
                                         |(schema, _)| {
-                                            let columns = query_result
-                                                .map(|result| result.columns.len())
-                                                .unwrap_or_default();
-                                            let rows = query_result
-                                                .map(|result| result.rows.len())
-                                                .unwrap_or_default();
-                                            format!(
-                                                "Table in schema {schema} · {columns} columns · {rows} rows loaded"
-                                            )
+                                            if table_preview_loading {
+                                                format!("Schema {schema} · Loading rows…")
+                                            } else {
+                                                let columns = query_result
+                                                    .map(|result| result.columns.len())
+                                                    .unwrap_or_default();
+                                                let rows = query_result
+                                                    .map(|result| result.rows.len())
+                                                    .unwrap_or_default();
+                                                format!(
+                                                    "Schema {schema} · {columns} columns · {rows} rows loaded"
+                                                )
+                                            }
                                         },
                                     )),
                             ),
@@ -264,7 +285,7 @@ pub fn render_workspace(
                                 .gap_2()
                                 .child(if compact_layout {
                                     Button::new("show-table-sidebar")
-                                        .outline()
+                                        .ghost()
                                         .xsmall()
                                         .label("Tables")
                                         .on_click(cx.listener(|this, _, _, cx| {
@@ -274,13 +295,27 @@ pub fn render_workspace(
                                 } else {
                                     div().into_any_element()
                                 })
+                                .child(
+                                    Button::new("toggle-sql-console")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(Icon::new(gpui_kit::assets::IconName::Terminal))
+                                        .label(if sql_console_expanded {
+                                            "Hide SQL"
+                                        } else {
+                                            "SQL Console"
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_sql_console(window, cx);
+                                        })),
+                                ),
                         ),
                 )
                 .child(
                     v_flex()
                         .flex_1()
                         .min_h(px(0.))
-                        .child(
+                        .child(if sql_console_expanded {
                             v_resizable("tablex-data-sql-split")
                                 .child(
                                     resizable_panel()
@@ -299,15 +334,20 @@ pub fn render_workspace(
                                             table_data_filter,
                                             table_data_filter_column,
                                             table_data_empty_filter,
-                                            filtered_table_data_rows,
+                                            filtered_table_data_rows.clone(),
                                             table_data_filter_pending,
-                                            hidden_table_data_columns,
+                                            hidden_table_data_columns.clone(),
                                             Some(table_result_scroll),
                                             Some(table_result_horizontal_scroll),
                                             true,
                                             table_column_filters,
                                             active_cell_edit.clone(),
                                             table_filter_editor.clone(),
+                                            table_preview_loading,
+                                            table_preview_error,
+                                            selected_table,
+                                            pinned_columns,
+                                            custom_column_order,
                                         )),
                                 )
                                 .child(
@@ -322,8 +362,39 @@ pub fn render_workspace(
                                             write_confirmation_pending,
                                             query_dock_tab,
                                         )),
-                                ),
-                        ),
+                                )
+                                .into_any_element()
+                        } else {
+                            query::render_result(
+                                cx,
+                                query_result,
+                                result_column_widths.clone(),
+                                table_data_offset,
+                                table_data_limit,
+                                table_data_has_next,
+                                query_running,
+                                table_data_sort,
+                                Some(table_data_filter_input),
+                                table_data_filter,
+                                table_data_filter_column,
+                                table_data_empty_filter,
+                                filtered_table_data_rows,
+                                table_data_filter_pending,
+                                hidden_table_data_columns,
+                                Some(table_result_scroll),
+                                Some(table_result_horizontal_scroll),
+                                true,
+                                table_column_filters,
+                                active_cell_edit,
+                                table_filter_editor,
+                                table_preview_loading,
+                                table_preview_error,
+                                selected_table,
+                                pinned_columns,
+                                custom_column_order,
+                            )
+                            .into_any_element()
+                        }),
                 ),
         )
 }

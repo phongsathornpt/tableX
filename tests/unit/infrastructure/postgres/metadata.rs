@@ -66,3 +66,12 @@ fn schema_filtered_request_rejects_cursor_from_another_schema() {
 
     assert_eq!(request.after, None);
 }
+
+#[test]
+fn database_names_query_queries_accessible_non_template_databases() {
+    assert!(super::DATABASE_NAMES_QUERY.contains("FROM pg_database"));
+    assert!(super::DATABASE_NAMES_QUERY.contains("datistemplate = false"));
+    assert!(super::DATABASE_NAMES_QUERY.contains("datallowconn = true"));
+    assert!(super::DATABASE_NAMES_QUERY.contains("has_database_privilege(datname, 'CONNECT')"));
+    assert_eq!(super::MAX_METADATA_DATABASES, 500);
+}

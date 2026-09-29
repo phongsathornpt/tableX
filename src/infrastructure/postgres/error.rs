@@ -12,8 +12,26 @@ pub(crate) fn format_connection_error(
         profile.host,
         profile.port,
         profile.database,
-        postgres_error_detail(&error)
+        format_postgres_error(&error)
     )
+}
+
+pub(crate) fn format_postgres_error(error: &tokio_postgres::Error) -> String {
+    if let Some(db_error) = error.as_db_error() {
+        let mut parts = Vec::new();
+        parts.push(format!("{}: {}", db_error.severity(), db_error.message()));
+        if let Some(detail) = db_error.detail() {
+            parts.push(format!("detail: {detail}"));
+        }
+        if let Some(hint) = db_error.hint() {
+            parts.push(format!("hint: {hint}"));
+        }
+        if let Some(where_) = db_error.where_() {
+            parts.push(format!("where: {where_}"));
+        }
+        return normalize_error_terms(parts.join("; "));
+    }
+    postgres_error_detail(error)
 }
 
 pub(crate) fn format_tls_connection_error(

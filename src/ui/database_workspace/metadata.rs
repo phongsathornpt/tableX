@@ -34,6 +34,9 @@ pub(crate) fn connect(
     workspace.pending_delete = None;
     workspace.object_explorer = None;
     workspace.selected_table = None;
+    workspace.active_database = None;
+    workspace.available_databases = Vec::new();
+    workspace.database_switch_loading = false;
     workspace.table_sidebar_visible = true;
     workspace.table_page_offset = 0;
     workspace.table_page_has_next = false;
@@ -43,6 +46,8 @@ pub(crate) fn connect(
     workspace.table_page_loading = true;
     workspace.query_result = None;
     workspace.result_column_widths = Default::default();
+    workspace.table_preview_loading = false;
+    workspace.table_preview_error = None;
     workspace.refresh_table_data_filter_cache(cx);
     workspace.query_generation = workspace.query_generation.wrapping_add(1);
     workspace.query_running = false;
@@ -95,6 +100,7 @@ pub(crate) fn finish_connection(
     match result {
         Ok(inspection) => {
             workspace.connection_status = crate::domain::connection::ConnectionStatus::Connected;
+            workspace.database_switch_loading = false;
             let success_notice = Notice::success(format!(
                 "Connected to PostgreSQL {} as {}",
                 inspection.server.version, inspection.server.user
@@ -105,9 +111,12 @@ pub(crate) fn finish_connection(
         }
         Err(error) => {
             workspace.table_page_loading = false;
+            workspace.database_switch_loading = false;
             workspace.connection_status =
                 crate::domain::connection::ConnectionStatus::Error(error.message.clone());
             workspace.server_version = None;
+            workspace.active_database = None;
+            workspace.available_databases = Vec::new();
             workspace.notice = Some(
                 Notice::error(
                     "Connection failed",
@@ -127,7 +136,7 @@ pub(crate) fn refresh_table_list(
     let Some(connection_id) = workspace.workspace.selected_connection.clone() else {
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         return;
     };
 
@@ -199,7 +208,7 @@ pub(crate) fn refresh(workspace: &mut DatabaseWorkspace, cx: &mut Context<Databa
         cx.notify();
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         workspace.notice = Some(Notice::error(
             "Connection unavailable",
             "The saved connection details are missing.",
@@ -335,6 +344,10 @@ fn apply_inspection(
     cx: &mut Context<DatabaseWorkspace>,
 ) -> Option<DatabaseError> {
     workspace.server_version = Some(inspection.server.version.to_string());
+    workspace.active_database = Some(inspection.server.database);
+    if !inspection.databases.is_empty() {
+        workspace.available_databases = inspection.databases;
+    }
     if let Some(explorer) = &mut workspace.object_explorer {
         explorer.set_schemas(inspection.schemas);
     } else {
@@ -361,6 +374,176 @@ fn apply_inspection(
         }
         None => None,
     }
+}
+
+pub(crate) fn switch_database(
+    workspace: &mut DatabaseWorkspace,
+    target_database: &str,
+    cx: &mut Context<DatabaseWorkspace>,
+) {
+    if workspace.active_database.as_deref() == Some(target_database) {
+        return;
+    }
+    let Some(connection_id) = workspace.workspace.selected_connection.clone() else {
+        return;
+    };
+    let Some(mut profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+        return;
+    };
+
+    let previous_database = workspace.active_database.clone();
+    let target_database = target_database.to_owned();
+
+    profile.database = target_database.clone();
+
+    // Session-based switch: clear active table, previews, and cell edits, but keep the current SQL query draft
+    workspace.selected_table = None;
+    workspace.query_result = None;
+    workspace.result_column_widths = Default::default();
+    workspace.table_preview_loading = false;
+    workspace.table_preview_error = None;
+    workspace.table_column_filters.clear();
+    workspace.table_data_filter = None;
+    workspace.table_data_filter_column = None;
+    workspace.table_data_empty_filter = None;
+    workspace.filtered_table_data_rows = None;
+    workspace.active_cell_edit = None;
+
+    workspace.database_switch_loading = true;
+    workspace.table_page_loading = true;
+    workspace.table_page_offset = 0;
+    workspace.table_page_has_next = false;
+    workspace.table_page_cursors = vec![None];
+    workspace.connection_generation = workspace.connection_generation.wrapping_add(1);
+    let connection_generation = workspace.connection_generation;
+    workspace.table_page_generation = workspace.table_page_generation.wrapping_add(1);
+    let table_page_generation = workspace.table_page_generation;
+
+    workspace.notice = Some(Notice::info(format!(
+        "Switching to database {target_database}..."
+    )));
+    cx.notify();
+
+    let provider = workspace.postgres_provider.clone();
+    let credential_store = workspace.credential_store;
+    let request = table_list_request(workspace, cx, 0);
+
+    let task = cx.background_spawn(async move {
+        let mut profile = profile;
+        if profile.password.is_none() {
+            profile.password = credential_store.load(&profile.id)?;
+        }
+        provider.inspect(profile, request)
+    });
+
+    cx.spawn(async move |this, cx| {
+        let result = task.await;
+        this.update(cx, |workspace, cx| {
+            finish_database_switch(
+                workspace,
+                &connection_id,
+                connection_generation,
+                table_page_generation,
+                previous_database,
+                target_database,
+                result,
+                cx,
+            );
+        })
+        .ok();
+    })
+    .detach();
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_database_switch(
+    workspace: &mut DatabaseWorkspace,
+    connection_id: &ConnectionId,
+    connection_generation: u64,
+    table_page_generation: u64,
+    previous_database: Option<String>,
+    target_database: String,
+    result: InspectionResult,
+    cx: &mut Context<DatabaseWorkspace>,
+) {
+    if workspace.workspace.selected_connection.as_ref() != Some(connection_id)
+        || workspace.connection_generation != connection_generation
+    {
+        return;
+    }
+
+    workspace.database_switch_loading = false;
+    match result {
+        Ok(inspection) => {
+            let success_notice = Notice::success(format!(
+                "Switched to database {}",
+                inspection.server.database
+            ));
+            workspace.notice = apply_inspection(workspace, inspection, table_page_generation, cx)
+                .map(table_page_failure_notice)
+                .or(Some(success_notice));
+        }
+        Err(error) => {
+            workspace.table_page_loading = false;
+            workspace.active_database = previous_database.clone();
+            let prev_name = previous_database.as_deref().unwrap_or("previous database");
+            workspace.notice = Some(
+                Notice::error(
+                    format!("Failed to switch to database {target_database}"),
+                    format!("Could not connect to {target_database}. Remaining on {prev_name}."),
+                )
+                .with_detail(error.message),
+            );
+        }
+    }
+    cx.notify();
+}
+
+pub(crate) fn refresh_databases(
+    workspace: &mut DatabaseWorkspace,
+    cx: &mut Context<DatabaseWorkspace>,
+) {
+    let Some(connection_id) = workspace.workspace.selected_connection.clone() else {
+        return;
+    };
+    let Some(profile) = workspace.active_profile(&connection_id) else {
+        return;
+    };
+
+    let provider = workspace.postgres_provider.clone();
+    let credential_store = workspace.credential_store;
+
+    let task = cx.background_spawn(async move {
+        let mut profile = profile;
+        if profile.password.is_none() {
+            profile.password = credential_store.load(&profile.id)?;
+        }
+        provider.list_databases(profile)
+    });
+
+    cx.spawn(async move |this, cx| {
+        let result = task.await;
+        this.update(cx, |workspace, cx| {
+            match result {
+                Ok(databases) => {
+                    workspace.available_databases = databases;
+                    workspace.notice = Some(Notice::info("Database list refreshed"));
+                }
+                Err(error) => {
+                    workspace.notice = Some(
+                        Notice::error(
+                            "Failed to refresh databases",
+                            "Could not query pg_database.",
+                        )
+                        .with_detail(error.message),
+                    );
+                }
+            }
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
 }
 
 fn table_page_failure_notice(error: DatabaseError) -> Notice {

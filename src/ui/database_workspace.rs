@@ -30,7 +30,6 @@ use crate::ui::{Notice, ObjectExplorer, homepage};
 mod connection_editor;
 mod connections;
 mod metadata;
-mod navigation;
 mod query;
 pub(crate) use connection_editor::ConnectionEditor;
 pub(crate) use query::is_inline_edit_type;
@@ -50,6 +49,9 @@ pub struct DatabaseWorkspace {
     connection_generation: u64,
     connection_status: ConnectionStatus,
     server_version: Option<String>,
+    active_database: Option<String>,
+    available_databases: Vec<String>,
+    database_switch_loading: bool,
     notice: Option<Notice>,
     connection_editor: Option<ConnectionEditor>,
     object_explorer: Option<ObjectExplorer>,
@@ -95,6 +97,18 @@ pub struct DatabaseWorkspace {
     table_result_scroll: UniformListScrollHandle,
     table_result_horizontal_scroll: gpui_kit::ScrollHandle,
     table_sidebar_visible: bool,
+    pub(crate) sql_console_expanded: bool,
+    pub(crate) table_preview_loading: bool,
+    pub(crate) table_preview_error: Option<String>,
+    pub(crate) custom_column_widths: HashMap<(String, String, String), f32>,
+    pub(crate) custom_column_order: HashMap<(String, String), Vec<String>>,
+    pub(crate) pinned_columns: HashMap<(String, String), HashSet<String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveDirection {
+    Left,
+    Right,
 }
 
 struct ActiveCellEdit {
@@ -177,6 +191,9 @@ impl DatabaseWorkspace {
             connection_generation: 0,
             connection_status: ConnectionStatus::Disconnected,
             server_version: None,
+            active_database: None,
+            available_databases: Vec::new(),
+            database_switch_loading: false,
             notice: storage_notice,
             connection_editor: None,
             object_explorer: None,
@@ -225,6 +242,12 @@ impl DatabaseWorkspace {
             table_result_scroll: UniformListScrollHandle::new(),
             table_result_horizontal_scroll: gpui_kit::ScrollHandle::new(),
             table_sidebar_visible: true,
+            sql_console_expanded: true,
+            table_preview_loading: false,
+            table_preview_error: None,
+            custom_column_widths: HashMap::new(),
+            custom_column_order: HashMap::new(),
+            pinned_columns: HashMap::new(),
         }
     }
 
@@ -265,6 +288,25 @@ impl DatabaseWorkspace {
         metadata::connect(self, connection_id, cx);
     }
 
+    pub(crate) fn active_profile(
+        &self,
+        connection_id: &ConnectionId,
+    ) -> Option<PostgresConnectionProfile> {
+        let mut profile = self.connection_profiles.get(connection_id).cloned()?;
+        if let Some(active_db) = &self.active_database {
+            profile.database = active_db.clone();
+        }
+        Some(profile)
+    }
+
+    pub(crate) fn switch_database(&mut self, target_database: &str, cx: &mut Context<Self>) {
+        metadata::switch_database(self, target_database, cx);
+    }
+
+    pub(crate) fn refresh_databases(&mut self, cx: &mut Context<Self>) {
+        metadata::refresh_databases(self, cx);
+    }
+
     pub(crate) fn execute_query(&mut self, cx: &mut Context<Self>) {
         query::execute_read_query(self, cx);
     }
@@ -289,9 +331,28 @@ impl DatabaseWorkspace {
     ) {
         self.query_dock_tab = tab;
         if tab == QueryDockTab::Query {
+            self.sql_console_expanded = true;
             self.query_input.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
+    }
+
+    pub(crate) fn toggle_sql_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sql_console_expanded = !self.sql_console_expanded;
+        if self.sql_console_expanded {
+            self.set_query_dock_tab(QueryDockTab::Query, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn open_sql_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sql_console_expanded = true;
+        self.set_query_dock_tab(QueryDockTab::Query, window, cx);
+    }
+
+    pub(crate) fn open_table_viewer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_query_dock_tab(QueryDockTab::Results, window, cx);
     }
 
     pub(crate) fn edit_selected_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -310,10 +371,17 @@ impl DatabaseWorkspace {
         if window.inner_window_bounds().get_bounds().size.width < px(760.) {
             self.table_sidebar_visible = false;
         }
+        self.query_dock_tab = QueryDockTab::Results;
         self.table_data_offset = 0;
         self.table_data_limit = 25;
         self.table_data_has_next = false;
         query::preview_table_page(self, schema, table, window, cx);
+    }
+
+    pub(crate) fn retry_preview_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((schema, table)) = self.selected_table.clone() {
+            query::preview_table_page(self, &schema, &table, window, cx);
+        }
     }
 
     pub(crate) fn refresh_selected_table(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -676,6 +744,199 @@ impl DatabaseWorkspace {
         cx.notify();
     }
 
+    pub(crate) fn hide_table_data_column(&mut self, column: &str, cx: &mut Context<Self>) {
+        if let Some(result) = self.query_result.as_ref() {
+            let cols = result.columns.clone();
+            self.toggle_table_data_column(column, &cols, cx);
+        }
+    }
+
+    pub(crate) fn table_key(&self) -> (String, String) {
+        if let Some((schema, table)) = &self.selected_table {
+            (schema.clone(), table.clone())
+        } else if let Some(table) = self.query_result.as_ref().and_then(|r| r.editable.as_ref()) {
+            (table.schema.clone(), table.table.clone())
+        } else {
+            (String::new(), String::new())
+        }
+    }
+
+    pub(crate) fn pinned_columns_for(&self, schema: &str, table: &str) -> HashSet<String> {
+        if let Some(pinned) = self
+            .pinned_columns
+            .get(&(schema.to_string(), table.to_string()))
+        {
+            pinned.clone()
+        } else {
+            let mut default_set = HashSet::new();
+            if let Some(editable) = self
+                .query_result
+                .as_ref()
+                .and_then(|result| result.editable.as_ref())
+            {
+                let schema_matches = schema.is_empty() || editable.schema == schema;
+                let table_matches = table.is_empty() || editable.table == table;
+                if schema_matches
+                    && table_matches
+                    && !editable.primary_key_columns.is_empty()
+                    && editable.primary_key_columns.len() <= 2
+                {
+                    for pk in &editable.primary_key_columns {
+                        default_set.insert(pk.clone());
+                    }
+                }
+            }
+            default_set
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_column_pinned(&self, schema: &str, table: &str, column: &str) -> bool {
+        self.pinned_columns_for(schema, table).contains(column)
+    }
+
+    pub(crate) fn custom_column_order_for(&self, schema: &str, table: &str) -> Option<&[String]> {
+        self.custom_column_order
+            .get(&(schema.to_string(), table.to_string()))
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn set_column_width(&mut self, schema: &str, table: &str, column: &str, width: f32) {
+        let clamped = width.clamp(80.0, 500.0);
+        self.custom_column_widths.insert(
+            (schema.to_string(), table.to_string(), column.to_string()),
+            clamped,
+        );
+        self.refresh_result_column_widths();
+    }
+
+    pub(crate) fn autofit_column_width(&mut self, schema: &str, table: &str, column: &str) {
+        let Some(result) = self.query_result.as_ref() else {
+            return;
+        };
+        let Some(column_index) = result.columns.iter().position(|c| c == column) else {
+            return;
+        };
+        let column_type = result
+            .column_types
+            .get(column_index)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let mut max_chars = column.len().max(column_type.len());
+        for row in result.rows.iter().take(100) {
+            if let Some(cell) = row.get(column_index) {
+                let cell_len = cell.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+                max_chars = max_chars.max(cell_len);
+            }
+        }
+        let computed_width = (max_chars as f32 * 8.5 + 48.0).clamp(80.0, 500.0);
+        self.set_column_width(schema, table, column, computed_width);
+    }
+
+    pub(crate) fn toggle_pin_column(&mut self, schema: &str, table: &str, column: &str) {
+        let key = (schema.to_string(), table.to_string());
+        let mut pinned = self.pinned_columns_for(schema, table);
+        if pinned.contains(column) {
+            pinned.remove(column);
+        } else {
+            pinned.insert(column.to_string());
+        }
+        self.pinned_columns.insert(key, pinned);
+    }
+
+    pub(crate) fn move_column(
+        &mut self,
+        schema: &str,
+        table: &str,
+        column: &str,
+        direction: MoveDirection,
+    ) {
+        let key = (schema.to_string(), table.to_string());
+        let mut order = self.custom_column_order.remove(&key).unwrap_or_else(|| {
+            self.query_result
+                .as_ref()
+                .map(|r| r.columns.clone())
+                .unwrap_or_default()
+        });
+        if let Some(pos) = order.iter().position(|c| c == column) {
+            match direction {
+                MoveDirection::Left if pos > 0 => {
+                    order.swap(pos, pos - 1);
+                }
+                MoveDirection::Right if pos + 1 < order.len() => {
+                    order.swap(pos, pos + 1);
+                }
+                _ => {}
+            }
+        }
+        self.custom_column_order.insert(key, order);
+        self.refresh_result_column_widths();
+    }
+
+    pub(crate) fn reorder_column(
+        &mut self,
+        schema: &str,
+        table: &str,
+        column: &str,
+        target_index: usize,
+    ) {
+        let key = (schema.to_string(), table.to_string());
+        let mut order = self.custom_column_order.remove(&key).unwrap_or_else(|| {
+            self.query_result
+                .as_ref()
+                .map(|r| r.columns.clone())
+                .unwrap_or_default()
+        });
+        if let Some(pos) = order.iter().position(|c| c == column) {
+            let col = order.remove(pos);
+            let target = target_index.min(order.len());
+            order.insert(target, col);
+        }
+        self.custom_column_order.insert(key, order);
+        self.refresh_result_column_widths();
+    }
+
+    pub(crate) fn reset_column_layout(&mut self, schema: &str, table: &str) {
+        self.custom_column_widths
+            .retain(|(s, t, _), _| s != schema || t != table);
+        self.custom_column_order
+            .remove(&(schema.to_string(), table.to_string()));
+        self.pinned_columns
+            .remove(&(schema.to_string(), table.to_string()));
+        self.refresh_result_column_widths();
+    }
+
+    pub(crate) fn refresh_result_column_widths(&mut self) {
+        let Some(result) = self.query_result.as_ref() else {
+            self.result_column_widths = Rc::new(Vec::new());
+            return;
+        };
+        let (schema, table) = self.table_key();
+        let widths = result
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                if let Some(custom) =
+                    self.custom_column_widths
+                        .get(&(schema.clone(), table.clone(), column.clone()))
+                {
+                    *custom
+                } else {
+                    crate::ui::home::query::table_column_width(
+                        column,
+                        result
+                            .column_types
+                            .get(index)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                    )
+                }
+            })
+            .collect();
+        self.result_column_widths = Rc::new(widths);
+    }
+
     pub(crate) fn clear_table_data_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.table_data_filter_input.update(cx, |state, cx| {
             state.set_value(String::new(), window, cx);
@@ -683,6 +944,69 @@ impl DatabaseWorkspace {
         self.table_data_filter = None;
         self.refresh_table_data_filter_cache(cx);
         cx.notify();
+    }
+
+    pub(crate) fn scroll_to_top(&self) {
+        self.table_result_scroll
+            .scroll_to_item(0, gpui_kit::ScrollStrategy::Top);
+    }
+
+    pub(crate) fn scroll_to_bottom(&self) {
+        self.table_result_scroll.scroll_to_bottom();
+    }
+
+    pub(crate) fn scroll_page_up(&self) {
+        let (current_top, _) = self
+            .table_result_scroll
+            .0
+            .borrow()
+            .base_handle
+            .logical_scroll_top();
+        let target = current_top.saturating_sub(15);
+        self.table_result_scroll
+            .scroll_to_item(target, gpui_kit::ScrollStrategy::Top);
+    }
+
+    pub(crate) fn scroll_page_down(&self) {
+        let total_rows = if let Some(indices) = self.filtered_table_data_rows.as_ref() {
+            indices.len()
+        } else if let Some(result) = self.query_result.as_ref() {
+            result.rows.len()
+        } else {
+            0
+        };
+        let (current_top, _) = self
+            .table_result_scroll
+            .0
+            .borrow()
+            .base_handle
+            .logical_scroll_top();
+        let target = (current_top + 15).min(total_rows.saturating_sub(1));
+        self.table_result_scroll
+            .scroll_to_item(target, gpui_kit::ScrollStrategy::Top);
+    }
+
+    pub(crate) fn scroll_to_first_column(&self) {
+        self.table_result_horizontal_scroll
+            .set_offset(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)));
+    }
+
+    pub(crate) fn scroll_to_last_column(&self) {
+        let max_x = self.table_result_horizontal_scroll.max_offset().x;
+        self.table_result_horizontal_scroll
+            .set_offset(gpui_kit::point(-max_x, gpui_kit::px(0.)));
+    }
+
+    pub(crate) fn scroll_horizontal_by(&self, delta_x: f32) {
+        let current_offset = self.table_result_horizontal_scroll.offset();
+        let max_x = self.table_result_horizontal_scroll.max_offset().x.as_f32();
+        let new_x = if max_x > 0.0 {
+            (current_offset.x.as_f32() + delta_x).clamp(-max_x, 0.0)
+        } else {
+            (current_offset.x.as_f32() + delta_x).min(0.0)
+        };
+        self.table_result_horizontal_scroll
+            .set_offset(gpui_kit::point(gpui_kit::px(new_x), gpui_kit::px(0.)));
     }
 
     pub(crate) fn prepare_query(
@@ -864,96 +1188,109 @@ impl Render for DatabaseWorkspace {
                 &self.connections,
                 connected,
                 self.server_version.as_deref(),
+                self.active_database.as_deref(),
+                &self.available_databases,
+                self.database_switch_loading,
                 &self.global_search,
+                self.table_sidebar_visible,
+                self.sql_console_expanded,
             )))
-            .child(if let Some(explorer) = &self.object_explorer {
-                let sidebar = explorer
-                    .render(
+            .child({
+                let (key_schema, key_table) = self.table_key();
+                let pinned_columns = self.pinned_columns_for(&key_schema, &key_table);
+                let custom_order = self
+                    .custom_column_order_for(&key_schema, &key_table)
+                    .map(|s| s.to_vec());
+                if let Some(explorer) = &self.object_explorer {
+                    let sidebar = explorer
+                        .render(
+                            cx,
+                            &self.table_search,
+                            self.table_schema_filter.as_deref(),
+                            self.table_type_filter,
+                            self.table_page_loading,
+                            self.table_page_offset,
+                            self.table_page_has_next,
+                            self.selected_table.as_ref(),
+                            compact_layout,
+                            self.query_dock_tab,
+                            self.sql_console_expanded,
+                            connected,
+                            selected_connection.map(|c| c.name.as_str()),
+                        )
+                        .into_any_element();
+                    let workspace = homepage::render_workspace(
                         cx,
-                        &self.table_search,
-                        self.table_schema_filter.as_deref(),
-                        self.table_type_filter,
-                        self.table_page_loading,
-                        self.table_page_offset,
-                        self.table_page_has_next,
+                        self.notice.as_ref(),
                         self.selected_table.as_ref(),
+                        &self.query_input,
+                        self.query_result.as_deref(),
+                        self.result_column_widths.clone(),
+                        self.query_running,
+                        self.write_confirmation_sql.is_some(),
+                        self.table_data_offset,
+                        self.table_data_limit,
+                        self.table_data_has_next,
+                        self.table_data_sort.as_ref(),
+                        &self.table_data_filter_input,
+                        self.table_data_filter.as_deref(),
+                        self.table_data_filter_column.clone(),
+                        self.table_data_empty_filter.clone(),
+                        self.filtered_table_data_rows.clone(),
+                        self.table_data_filter_pending,
+                        self.hidden_table_data_columns.clone(),
+                        &self.table_result_scroll,
+                        &self.table_result_horizontal_scroll,
                         compact_layout,
+                        self.query_dock_tab,
+                        &self.table_column_filters,
+                        self.active_cell_edit(),
+                        Some((
+                            self.table_filter_editor_column.clone(),
+                            self.table_filter_editor_operator,
+                            self.table_filter_input.clone(),
+                        )),
+                        self.sql_console_expanded,
+                        self.table_preview_loading,
+                        self.table_preview_error.as_deref(),
+                        &pinned_columns,
+                        custom_order.as_deref(),
                     )
                     .into_any_element();
-                let workspace = homepage::render_workspace(
-                    cx,
-                    self.notice.as_ref(),
-                    self.selected_table.as_ref(),
-                    &self.query_input,
-                    self.query_result.as_deref(),
-                    self.result_column_widths.clone(),
-                    self.query_running,
-                    self.write_confirmation_sql.is_some(),
-                    self.table_data_offset,
-                    self.table_data_limit,
-                    self.table_data_has_next,
-                    self.table_data_sort.as_ref(),
-                    &self.table_data_filter_input,
-                    self.table_data_filter.as_deref(),
-                    self.table_data_filter_column.clone(),
-                    self.table_data_empty_filter.clone(),
-                    self.filtered_table_data_rows.clone(),
-                    self.table_data_filter_pending,
-                    self.hidden_table_data_columns.clone(),
-                    &self.table_result_scroll,
-                    &self.table_result_horizontal_scroll,
-                    compact_layout,
-                    self.query_dock_tab,
-                    &self.table_column_filters,
-                    self.active_cell_edit(),
-                    Some((
-                        self.table_filter_editor_column.clone(),
-                        self.table_filter_editor_operator,
-                        self.table_filter_input.clone(),
-                    )),
-                )
-                .into_any_element();
-                if compact_layout {
-                    if self.table_sidebar_visible {
-                        h_flex().size_full().child(sidebar).into_any_element()
+                    if compact_layout {
+                        if self.table_sidebar_visible {
+                            h_flex().size_full().child(sidebar).into_any_element()
+                        } else {
+                            h_flex().size_full().child(workspace).into_any_element()
+                        }
                     } else {
-                        h_flex().size_full().child(workspace).into_any_element()
+                        let mut layout = h_flex().size_full();
+                        if self.table_sidebar_visible {
+                            layout = layout.child(sidebar);
+                        }
+                        layout.child(workspace).into_any_element()
                     }
                 } else {
-                    let navigation = navigation::render(
+                    homepage::render(
                         cx,
-                        connected,
-                        selected_connection.map(|connection| connection.name.as_str()),
-                        self.table_sidebar_visible,
-                        self.query_dock_tab,
+                        homepage::HomepageView {
+                            connections: &self.connections,
+                            selected_connection,
+                            connection_editor: self.connection_editor.as_ref(),
+                            connection_test_running: self.connection_test_running,
+                            pending_delete: self.pending_delete.as_ref(),
+                            notice: self.notice.as_ref(),
+                            connected,
+                            server_version: self.server_version.as_deref(),
+                            query_input: &self.query_input,
+                            query_result: self.query_result.as_deref(),
+                            result_column_widths: self.result_column_widths.clone(),
+                            query_running: self.query_running,
+                            write_confirmation_pending: self.write_confirmation_sql.is_some(),
+                        },
                     )
-                    .into_any_element();
-                    let mut layout = h_flex().size_full().child(navigation);
-                    if self.table_sidebar_visible {
-                        layout = layout.child(sidebar);
-                    }
-                    layout.child(workspace).into_any_element()
+                    .into_any_element()
                 }
-            } else {
-                homepage::render(
-                    cx,
-                    homepage::HomepageView {
-                        connections: &self.connections,
-                        selected_connection,
-                        connection_editor: self.connection_editor.as_ref(),
-                        connection_test_running: self.connection_test_running,
-                        pending_delete: self.pending_delete.as_ref(),
-                        notice: self.notice.as_ref(),
-                        connected,
-                        server_version: self.server_version.as_deref(),
-                        query_input: &self.query_input,
-                        query_result: self.query_result.as_deref(),
-                        result_column_widths: self.result_column_widths.clone(),
-                        query_running: self.query_running,
-                        write_confirmation_pending: self.write_confirmation_sql.is_some(),
-                    },
-                )
-                .into_any_element()
             })
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_sheet_layer(window, cx))

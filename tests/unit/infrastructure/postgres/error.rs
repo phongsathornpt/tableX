@@ -34,3 +34,10 @@ fn normalizes_rustls_unknown_issuer_text() {
         "invalid peer certificate: unknown issuer"
     );
 }
+
+#[test]
+fn formats_postgres_error_from_non_db_and_normalizes() {
+    let error = tokio_postgres::Error::__private_api_timeout();
+    let formatted = super::format_postgres_error(&error);
+    assert_eq!(formatted, "timeout waiting for server");
+}

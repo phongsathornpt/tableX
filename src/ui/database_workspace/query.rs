@@ -1,4 +1,4 @@
-use super::DatabaseWorkspace;
+use super::{DatabaseWorkspace, QueryDockTab};
 use crate::domain::connection::ConnectionId;
 use crate::domain::query::{
     CellUpdateRequest, MutationResult, QueryResult, TableDataCursor, TablePreviewPageRequest,
@@ -22,7 +22,7 @@ pub(crate) fn execute_read_query(
         cx.notify();
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         workspace.notice = Some(Notice::error(
             "Connection unavailable",
             "The saved connection details are missing.",
@@ -73,7 +73,7 @@ pub(crate) fn execute_write_query(
         cx.notify();
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         workspace.notice = Some(Notice::error(
             "Connection unavailable",
             "The saved connection details are missing.",
@@ -265,7 +265,7 @@ pub(crate) fn save_table_cell_edit(
         cx.notify();
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         workspace.notice = Some(Notice::error(
             "Connection unavailable",
             "The saved connection details are missing.",
@@ -441,16 +441,24 @@ fn preview_table_page_inner(
     cx: &mut Context<DatabaseWorkspace>,
 ) {
     workspace.active_cell_edit = None;
-    if workspace
+    let is_new_table = workspace
         .selected_table
         .as_ref()
-        .is_none_or(|(old_schema, old_table)| old_schema != schema || old_table != table)
-    {
+        .is_none_or(|(old_schema, old_table)| old_schema != schema || old_table != table);
+    if is_new_table {
         workspace.table_column_filters.clear();
+        workspace.table_data_sort = None;
+        workspace.table_data_filter = None;
+        workspace.table_data_filter_column = None;
+        workspace.table_data_empty_filter = None;
+        workspace.filtered_table_data_rows = None;
         workspace.active_cell_edit = None;
         workspace.table_data_offset = 0;
+        workspace.query_result = None;
+        workspace.result_column_widths = Default::default();
     }
     workspace.selected_table = Some((schema.to_owned(), table.to_owned()));
+    workspace.query_dock_tab = QueryDockTab::Results;
     let primary_key_columns = workspace
         .query_result
         .as_ref()
@@ -495,25 +503,26 @@ fn preview_table_page_inner(
             "No database connected",
             "Connect to a database before previewing a table.",
         ));
+        workspace.table_preview_loading = false;
         cx.notify();
         return;
     };
-    let Some(profile) = workspace.connection_profiles.get(&connection_id).cloned() else {
+    let Some(profile) = workspace.active_profile(&connection_id) else {
         workspace.notice = Some(Notice::error(
             "Connection unavailable",
             "The saved connection details are missing.",
         ));
+        workspace.table_preview_loading = false;
         cx.notify();
         return;
     };
-    if workspace.query_running {
-        return;
-    }
     workspace.write_confirmation_sql = None;
     workspace.query_generation = workspace.query_generation.wrapping_add(1);
     let query_generation = workspace.query_generation;
     workspace.query_running = true;
-    workspace.notice = Some(Notice::info(format!("Loading {schema}.{table}...")));
+    workspace.table_preview_loading = true;
+    workspace.table_preview_error = None;
+    workspace.notice = None;
     cx.notify();
 
     let credential_store = workspace.credential_store;
@@ -599,15 +608,16 @@ pub(crate) fn finish_table_preview(
         return;
     }
     workspace.query_running = false;
+    workspace.table_preview_loading = false;
     match result {
         Ok(result) => {
             let row_count = result.rows.len();
-            workspace.result_column_widths =
-                crate::ui::homepage::query::result_column_widths(&result);
+            workspace.table_preview_error = None;
             workspace.table_data_offset = result.offset;
             workspace.table_data_limit = result.limit;
             workspace.table_data_has_next = result.has_next;
             workspace.query_result = Some(Arc::new(result));
+            workspace.refresh_result_column_widths();
             workspace.notice = Some(if workspace.cell_update_reload_pending {
                 workspace.cell_update_reload_pending = false;
                 Notice::success("Cell updated and table refreshed")
@@ -618,17 +628,19 @@ pub(crate) fn finish_table_preview(
         Err(error) => {
             workspace.query_result = None;
             workspace.result_column_widths = Default::default();
-            workspace.notice = Some(if workspace.cell_update_reload_pending {
+            workspace.table_preview_error = Some(error.message.clone());
+            workspace.notice = if workspace.cell_update_reload_pending {
                 workspace.cell_update_reload_pending = false;
-                Notice::warning(
-                    "Cell saved, but refresh failed",
-                    "The database change committed; refresh the table to verify the current row.",
+                Some(
+                    Notice::warning(
+                        "Cell saved, but refresh failed",
+                        "The database change committed; refresh the table to verify the current row.",
+                    )
+                    .with_detail(error.message),
                 )
-                .with_detail(error.message)
             } else {
-                Notice::error("Table preview failed", "Could not load this table.")
-                    .with_detail(error.message)
-            });
+                None
+            };
         }
     }
     workspace.refresh_table_data_filter_cache(cx);
@@ -651,9 +663,8 @@ pub(crate) fn finish_query(
     match result {
         Ok(result) => {
             let row_count = result.rows.len();
-            workspace.result_column_widths =
-                crate::ui::homepage::query::result_column_widths(&result);
             workspace.query_result = Some(Arc::new(result));
+            workspace.refresh_result_column_widths();
             workspace.notice = Some(Notice::success(format!(
                 "Query completed: {row_count} row(s) returned"
             )));

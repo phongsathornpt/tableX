@@ -170,71 +170,82 @@ impl ObjectExplorer {
         table_has_next: bool,
         selected_table: Option<&(String, String)>,
         compact_layout: bool,
+        query_dock_tab: crate::ui::database_workspace::QueryDockTab,
+        sql_console_expanded: bool,
+        connected: bool,
+        connection_name: Option<&str>,
     ) -> impl IntoElement {
         let workspace = cx.entity();
         let filter_count =
             usize::from(schema_filter.is_some()) + usize::from(type_filter.is_some());
         v_flex()
-            .w(px(276.))
+            .w(px(256.))
             .h_full()
-            .min_w(px(232.))
+            .min_w(px(220.))
             .border_r_1()
             .border_color(cx.theme().border)
-            .bg(cx.theme().background)
+            .bg(cx.theme().sidebar)
             .child(
                 v_flex()
-                    .gap_3()
-                    .px_3()
-                    .pt_5()
-                    .pb_2()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .gap_0p5()
                     .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                v_flex().gap_1().child(
-                                    div()
-                                        .text_base()
-                                        .font_weight(FontWeight::BOLD)
-                                        .child("Database Objects"),
-                                ),
+                        ListItem::new("workspace-nav-tables")
+                            .w_full()
+                            .h(px(26.))
+                            .rounded_md()
+                            .text_sm()
+                            .selected(
+                                query_dock_tab
+                                    == crate::ui::database_workspace::QueryDockTab::Results
+                                    && !sql_console_expanded,
                             )
                             .child(
-                                Button::new("refresh-database-objects")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw))
-                                    .tooltip("Refresh database objects")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.refresh_database_objects(cx)
-                                    })),
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_1()
+                                    .child(Icon::new(gpui_kit::assets::IconName::Table))
+                                    .child("Table Viewer"),
                             )
-                            .child(
-                                Button::new(if compact_layout {
-                                    "show-table-workspace"
-                                } else {
-                                    "collapse-database-objects"
-                                })
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(if compact_layout {
-                                    gpui_kit::assets::IconName::PanelRightClose
-                                } else {
-                                    gpui_kit::assets::IconName::PanelLeftClose
-                                }))
-                                .tooltip(if compact_layout {
-                                    "Return to workspace"
-                                } else {
-                                    "Hide database objects"
-                                })
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.toggle_table_sidebar(cx)),
-                                ),
-                            ),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_table_viewer(window, cx);
+                            })),
                     )
+                    .child(
+                        ListItem::new("workspace-nav-sql")
+                            .w_full()
+                            .h(px(26.))
+                            .rounded_md()
+                            .text_sm()
+                            .selected(sql_console_expanded)
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .gap_2()
+                                    .px_1()
+                                    .child(Icon::new(gpui_kit::assets::IconName::Terminal))
+                                    .child("SQL Console"),
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_sql_editor(window, cx);
+                            })),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_1p5()
+                    .px_2()
+                    .pt_1()
+                    .pb_2()
                     .child(
                         h_flex().child(
                             Input::new(table_search)
+                                .xsmall()
                                 .flex_1()
                                 .prefix(Icon::new(IconName::Search))
                                 .suffix(
@@ -264,6 +275,49 @@ impl ObjectExplorer {
                         type_filter,
                         workspace.clone(),
                     )),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .px_3()
+                    .pt_1()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("DATABASE OBJECTS"),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("refresh-database-objects")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw))
+                                    .tooltip("Refresh database objects")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.refresh_database_objects(cx)
+                                    })),
+                            )
+                            .child(if compact_layout {
+                                Button::new("show-table-workspace")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(gpui_kit::assets::IconName::PanelRightClose))
+                                    .tooltip("Return to workspace")
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_table_sidebar(cx)),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    ),
             )
             .child(if table_loading {
                 div()
@@ -325,6 +379,51 @@ impl ObjectExplorer {
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.next_table_page(cx)),
                                     ),
+                            ),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .h(px(32.))
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().sidebar)
+                    .child(
+                        Button::new("connection-settings-nav")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(gpui_kit::assets::IconName::Settings2))
+                            .label("Settings")
+                            .tooltip("Connection settings")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.edit_selected_connection(window, cx);
+                            })),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().w(px(6.)).h(px(6.)).rounded_full().bg(if connected {
+                                cx.theme().success
+                            } else {
+                                cx.theme().muted_foreground
+                            }))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(connection_name.map(ToOwned::to_owned).unwrap_or_else(
+                                        || {
+                                            if connected {
+                                                "Connected".to_owned()
+                                            } else {
+                                                "Disconnected".to_owned()
+                                            }
+                                        },
+                                    )),
                             ),
                     ),
             )

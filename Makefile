@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help fmt fmt-check check clippy test test-postgres build build-release run verify tag clean
+.PHONY: help fmt fmt-check check clippy test test-postgres build build-release run verify tag push-tag clean
 
 help:
 	@printf '%s\n' \
@@ -16,6 +16,7 @@ help:
 		'  make run        Run the desktop application' \
 		'  make verify     Run formatting, checks, and tests' \
 		'  make tag        Create an annotated v<package version> Git tag locally' \
+		'  make push-tag   Push the version tag to origin' \
 		'  make clean      Remove Cargo build artifacts'
 
 fmt:
@@ -62,6 +63,13 @@ tag:
 		echo "Tag $$tag already exists" >&2; exit 1; \
 	fi; \
 	git tag -a "$$tag" -m "tableX $$tag"
+
+push-tag:
+	@version="$$(awk -F '"' '/^\[package\]$$/ { in_package=1; next } /^\[/ { in_package=0 } in_package && /^version = / { print $$2; exit }' Cargo.toml)"; \
+	test -n "$$version" || { echo 'Could not read package version from Cargo.toml' >&2; exit 1; }; \
+	tag="v$$version"; \
+	git rev-parse -q --verify "refs/tags/$$tag" >/dev/null || { echo "Create the local tag with 'make tag' first" >&2; exit 1; }; \
+	git push origin "$$tag"
 
 clean:
 	cargo clean

@@ -140,13 +140,22 @@ async fn execute_table_preview_client(
                 let fallback_sql = preview_select_sql(&schema, &table, sort, &[]);
                 session.read_statement(client, &fallback_sql).await
             }
+            Err(error) if sort.is_some() => {
+                let fallback_sql = preview_select_sql(&schema, &table, None, &[]);
+                match session.read_statement(client, &fallback_sql).await {
+                    Ok(statement) => Ok(statement),
+                    Err(_) => Err(error),
+                }
+            }
             Err(error) => Err(error),
         }
     };
-    let (base_statement, primary_key_statement) = futures_util::try_join!(
+    let (base_statement, primary_key_statement) = futures_util::join!(
         preview_statement,
         session.read_statement(client, TABLE_PRIMARY_KEY_QUERY),
-    )?;
+    );
+    let base_statement = base_statement?;
+    let primary_key_statement = primary_key_statement.ok();
     let column_type_specs = base_statement
         .columns()
         .iter()
@@ -249,12 +258,14 @@ async fn execute_table_preview_client(
             .await
         }
     };
-    let (requested_rows, primary_key_result) = futures_util::join!(
-        requested_page_future,
-        client.query(&primary_key_statement, &primary_key_parameters),
-    );
+    let (requested_rows, primary_key_result) = futures_util::join!(requested_page_future, async {
+        if let Some(statement) = primary_key_statement.as_ref() {
+            client.query(statement, &primary_key_parameters).await.ok()
+        } else {
+            None
+        }
+    },);
     let primary_key_columns = primary_key_result
-        .ok()
         .map(|rows| {
             rows.into_iter()
                 .filter_map(|row| row.try_get::<_, String>(0).ok())
@@ -633,7 +644,12 @@ async fn read_preview_rows_with_parameters(
         client
             .query_raw(statement, parameters.iter().copied())
             .await
-            .map_err(|error| DatabaseError::new(format!("table preview failed: {error}")))?,
+            .map_err(|error| {
+                DatabaseError::new(format!(
+                    "table preview failed: {}",
+                    format_postgres_error(&error)
+                ))
+            })?,
     );
     let mut total_bytes = 0usize;
     let mut rows = DecodedRows {
@@ -642,11 +658,12 @@ async fn read_preview_rows_with_parameters(
         truncated_cells: Vec::with_capacity(limit + 1),
     };
     let mut decode_error = None;
-    while let Some(row) = row_stream
-        .try_next()
-        .await
-        .map_err(|error| DatabaseError::new(format!("table preview failed: {error}")))?
-    {
+    while let Some(row) = row_stream.try_next().await.map_err(|error| {
+        DatabaseError::new(format!(
+            "table preview failed: {}",
+            format_postgres_error(&error)
+        ))
+    })? {
         if decode_error.is_none() {
             match decode_row(&row, column_count, &mut total_bytes) {
                 Ok(decoded) => {

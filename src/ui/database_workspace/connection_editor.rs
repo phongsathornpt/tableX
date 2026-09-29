@@ -6,7 +6,7 @@ use gpui_kit::component::{
     input::{Input, InputContentType, InputState},
 };
 use gpui_kit::{
-    AppContext as _, Context, IntoElement, ParentElement as _, Styled as _, Window, div,
+    AppContext as _, Context, IntoElement, ParentElement as _, Styled as _, Window, div, px,
 };
 
 use super::{DatabaseWorkspace, ssl_description, ssl_label, ssl_menu_item};
@@ -165,9 +165,10 @@ impl ConnectionEditor {
     ) -> impl IntoElement {
         v_flex()
             .w_full()
+            .max_w(px(580.))
             .gap_4()
-            .p_5()
-            .rounded_md()
+            .p_6()
+            .rounded_xl()
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().secondary)
@@ -177,57 +178,102 @@ impl ConnectionEditor {
                     .child(
                         div()
                             .text_lg()
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .font_weight(gpui_kit::FontWeight::BOLD)
                             .child(if self.editing_id.is_some() {
-                                "Edit PostgreSQL connection"
+                                "Edit PostgreSQL Connection"
                             } else {
-                                "Add PostgreSQL connection"
+                                "New PostgreSQL Connection"
                             }),
                     )
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(if self.editing_id.is_some() {
-                                "Passwords are stored in the operating system credential store, never in the connection file. Leave blank to keep the saved password."
+                                "Passwords are saved securely in your operating system keychain. Leave blank to keep existing password."
                             } else {
-                                "Passwords are stored in the operating system credential store, never in the connection file."
+                                "Passwords are saved securely in your operating system keychain."
                             }),
                     ),
             )
-            .child(self.field("Name", &self.name, "e.g. Production"))
-            .child(self.field("Host", &self.host, "localhost or db.example.com"))
             .child(
-                h_flex()
-                    .gap_3()
-                    .child(self.field("Port", &self.port, "5432"))
-                    .child(self.field("Database", &self.database, "postgres")),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
-                    .child(self.field("User", &self.user, "postgres"))
-                    .child(self.field_with_type(
-                        "Password",
-                        &self.password,
-                        "Optional for local auth",
-                        Some(InputContentType::Password),
-                    )),
-            )
-            .child(self.ssl_field(cx))
-            .child(self.certificate_field(cx))
-            .child(
-                h_flex()
-                    .justify_end()
+                v_flex()
                     .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
                     .child(
-                        Button::new("test-connection")
-                            .outline()
-                            .small()
-                            .label(if test_running { "Testing..." } else { "Test connection" })
-                            .disabled(test_running)
-                            .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("GENERAL"),
                     )
+                    .child(self.field("Name", &self.name, "e.g. Production"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(self.field("Host", &self.host, "localhost or db.example.com"))
+                            .child(
+                                div()
+                                    .w(px(100.))
+                                    .child(self.field("Port", &self.port, "5432")),
+                            ),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("AUTHENTICATION"),
+                    )
+                    .child(self.field("Database", &self.database, "postgres"))
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .child(self.field("User", &self.user, "postgres"))
+                            .child(self.field_with_type(
+                                "Password",
+                                &self.password,
+                                "Optional for local auth",
+                                Some(InputContentType::Password),
+                            )),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(cx.theme().background)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().muted_foreground)
+                            .child("SECURITY & TLS"),
+                    )
+                    .child(self.ssl_field(cx))
+                    .child(self.certificate_field(cx)),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .pt_2()
                     .child(
                         Button::new("cancel-connection")
                             .outline()
@@ -238,16 +284,29 @@ impl ConnectionEditor {
                             ),
                     )
                     .child(
-                        Button::new("save-connection")
-                            .primary()
-                            .small()
-                            .label(if self.editing_id.is_some() {
-                                "Save changes"
-                            } else {
-                                "Save connection"
-                            })
-                            .disabled(test_running)
-                            .on_click(cx.listener(|this, _, _, cx| this.save_connection(cx))),
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                Button::new("test-connection")
+                                    .outline()
+                                    .small()
+                                    .label(if test_running { "Testing..." } else { "Test connection" })
+                                    .disabled(test_running)
+                                    .on_click(cx.listener(|this, _, _, cx| this.test_connection(cx))),
+                            )
+                            .child(
+                                Button::new("save-connection")
+                                    .primary()
+                                    .small()
+                                    .label(if self.editing_id.is_some() {
+                                        "Save changes"
+                                    } else {
+                                        "Save connection"
+                                    })
+                                    .disabled(test_running)
+                                    .on_click(cx.listener(|this, _, _, cx| this.save_connection(cx))),
+                            ),
                     ),
             )
     }

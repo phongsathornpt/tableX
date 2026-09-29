@@ -29,6 +29,7 @@ pub struct PostgresProvider {
 #[derive(Debug)]
 pub struct PostgresInspection {
     pub server: PostgresServerInfo,
+    pub databases: Vec<String>,
     pub schemas: Vec<String>,
     pub table_page: Option<Result<TablePage, DatabaseError>>,
 }
@@ -50,6 +51,13 @@ impl PostgresProvider {
         request: metadata::TableListRequest,
     ) -> Result<PostgresInspection, DatabaseError> {
         metadata::inspect(self, profile, request)
+    }
+
+    pub fn list_databases(
+        &self,
+        profile: PostgresConnectionProfile,
+    ) -> Result<Vec<String>, DatabaseError> {
+        metadata::list_databases(self, profile)
     }
 
     pub fn list_tables(

@@ -2,7 +2,7 @@ use super::PostgresProvider;
 #[cfg(test)]
 use super::connect::read_only_connection_config;
 use super::connect::{connect_with_timeout, mutation_connection_config, rustls_connector};
-use super::error::{format_connection_error, format_tls_connection_error};
+use super::error::{format_connection_error, format_postgres_error, format_tls_connection_error};
 use super::metadata::{MetadataSession, MetadataSessionCache};
 use super::model::{PostgresConnectionProfile, PostgresSslMode};
 use super::runtime;
@@ -41,7 +41,7 @@ const MAX_CELL_UPDATE_VALUE_BYTES: usize = 1024 * 1024;
 const TABLE_PRIMARY_KEY_QUERY: &str = "SELECT a.attname
          FROM pg_index i
          JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-         WHERE i.indrelid = to_regclass($1) AND i.indisprimary
+         WHERE i.indrelid = to_regclass($1::text) AND i.indisprimary
          ORDER BY array_position(i.indkey, a.attnum)";
 
 #[derive(Default)]
@@ -251,7 +251,10 @@ where
     );
     let describe_sql = format!("SELECT * FROM {relation} LIMIT 0");
     let describe = client.prepare(&describe_sql).await.map_err(|error| {
-        DatabaseError::new(format!("could not inspect the target table: {error}"))
+        DatabaseError::new(format!(
+            "could not inspect the target table: {}",
+            format_postgres_error(&error)
+        ))
     })?;
     let column_type = |name: &str| {
         describe
@@ -275,14 +278,18 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     let sql = build_cell_update_sql(&relation, &request, &value_type, &key_types);
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not begin cell update: {error}")))?;
-    let statement = transaction
-        .prepare(&sql)
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not prepare cell update: {error}")))?;
+    let transaction = client.transaction().await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not begin cell update: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
+    let statement = transaction.prepare(&sql).await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not prepare cell update: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
     let mut parameters: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
         Vec::with_capacity(request.primary_key_values.len() + 2);
     parameters.push(&request.value);
@@ -297,7 +304,10 @@ where
         .execute(&statement, &parameters)
         .await
         .map_err(|error| {
-            DatabaseError::new(format!("cell update failed and was rolled back: {error}"))
+            DatabaseError::new(format!(
+                "cell update failed and was rolled back: {}",
+                format_postgres_error(&error)
+            ))
         })?;
     if affected_rows != 1 {
         return Err(DatabaseError::new(if affected_rows == 0 {
@@ -306,10 +316,12 @@ where
             "The row key matched more than one row. The update was rolled back."
         }));
     }
-    transaction
-        .commit()
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not commit cell update: {error}")))?;
+    transaction.commit().await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not commit cell update: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
     Ok(MutationResult { affected_rows })
 }
 
@@ -392,17 +404,24 @@ where
         }
     });
 
-    let transaction = client
-        .transaction()
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not begin transaction: {error}")))?;
-    let affected_rows = transaction.execute(sql, &[]).await.map_err(|error| {
-        DatabaseError::new(format!("mutation failed and was rolled back: {error}"))
+    let transaction = client.transaction().await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not begin transaction: {}",
+            format_postgres_error(&error)
+        ))
     })?;
-    transaction
-        .commit()
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not commit mutation: {error}")))?;
+    let affected_rows = transaction.execute(sql, &[]).await.map_err(|error| {
+        DatabaseError::new(format!(
+            "mutation failed and was rolled back: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
+    transaction.commit().await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not commit mutation: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
     Ok(MutationResult { affected_rows })
 }
 
@@ -440,18 +459,23 @@ async fn execute_query_client(
     let statement = session.read_statement(client, sql).await?;
     let transaction = client.transaction().await.map_err(|error| {
         DatabaseError::new(format!(
-            "could not begin read-only query transaction: {error}"
+            "could not begin read-only query transaction: {}",
+            format_postgres_error(&error)
         ))
     })?;
-    let portal = transaction
-        .bind(&statement, &[])
-        .await
-        .map_err(|error| DatabaseError::new(format!("could not bind query portal: {error}")))?;
+    let portal = transaction.bind(&statement, &[]).await.map_err(|error| {
+        DatabaseError::new(format!(
+            "could not bind query portal: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
     let mut row_stream = Box::pin(
         transaction
             .query_portal_raw(&portal, (MAX_QUERY_ROWS + 1) as i32)
             .await
-            .map_err(|error| DatabaseError::new(format!("query failed: {error}")))?,
+            .map_err(|error| {
+                DatabaseError::new(format!("query failed: {}", format_postgres_error(&error)))
+            })?,
     );
     let columns = statement
         .columns()
@@ -474,11 +498,9 @@ async fn execute_query_client(
         let mut truncated_cells = Vec::with_capacity(MAX_QUERY_ROWS.min(128));
         let mut total_bytes = 0usize;
         let mut truncated = false;
-        while let Some(row) = row_stream
-            .try_next()
-            .await
-            .map_err(|error| DatabaseError::new(format!("query failed: {error}")))?
-        {
+        while let Some(row) = row_stream.try_next().await.map_err(|error| {
+            DatabaseError::new(format!("query failed: {}", format_postgres_error(&error)))
+        })? {
             if rows.len() == MAX_QUERY_ROWS {
                 truncated = true;
                 continue;
@@ -496,7 +518,8 @@ async fn execute_query_client(
 
     transaction.rollback().await.map_err(|error| {
         DatabaseError::new(format!(
-            "could not close read-only query transaction: {error}"
+            "could not close read-only query transaction: {}",
+            format_postgres_error(&error)
         ))
     })?;
     let (rows, null_cells, truncated_cells, truncated) = decoded_rows?;

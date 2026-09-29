@@ -1,7 +1,9 @@
 use super::{
     AsciiCaseInsensitiveMatcher, TABLE_CELL_PREVIEW_CHARS, contains_ascii_case_insensitive,
-    is_inline_editable_cell, matching_row_indices, matching_row_indices_with_cancellation,
-    result_cell_value, table_column_width, visible_cell_prefix,
+    flatten_cell_preview, is_inline_editable_cell, is_mono_column_type, matching_row_indices,
+    matching_row_indices_with_cancellation, result_cell_value, result_column_widths,
+    table_column_width, visible_cell_prefix, visible_column_window,
+    visible_column_window_with_pinned,
 };
 use crate::domain::query::{EditableTable, QueryResult};
 
@@ -192,4 +194,95 @@ fn filtered_row_matching_can_be_cancelled_and_respects_zero_limit() {
         ),),
         Some(vec![])
     );
+}
+
+#[test]
+fn visible_column_window_filters_hidden_columns() {
+    let columns = vec!["id".into(), "name".into(), "email".into(), "bio".into()];
+    let widths = vec![100.0, 150.0, 200.0, 300.0];
+    let mut hidden = std::collections::HashSet::new();
+    hidden.insert("email".into());
+
+    let (visible, leading, trailing) =
+        visible_column_window(&columns, &widths, &hidden, false, None);
+    assert_eq!(visible, vec![0, 1, 3]);
+    assert_eq!(leading, 0.0);
+    assert_eq!(trailing, 0.0);
+}
+
+#[test]
+fn computes_result_column_widths() {
+    let result = QueryResult {
+        columns: vec!["id".into(), "name".into()],
+        column_types: vec!["int4".into(), "text".into()],
+        column_enum_values: vec![None, None],
+        rows: vec![],
+        null_cells: vec![],
+        truncated_cells: vec![],
+        offset: 0,
+        limit: 10,
+        has_next: false,
+        truncated: false,
+        editable: None,
+    };
+    let widths = result_column_widths(&result);
+    assert_eq!(widths.len(), 2);
+    assert!(widths[0] >= 80.0);
+    assert!(widths[1] >= 80.0);
+}
+
+#[test]
+fn flattens_multiline_thai_and_general_cell_previews() {
+    let thai_multiline = "บริการให้คำแนะนำด้านการดูแลและ\nการป้องกันกำจัดโรคพืช โรคแมลง และ ศัตรูพืช";
+    let flattened = flatten_cell_preview(thai_multiline);
+    assert_eq!(
+        flattened.as_ref(),
+        "บริการให้คำแนะนำด้านการดูแลและ การป้องกันกำจัดโรคพืช โรคแมลง และ ศัตรูพืช"
+    );
+    assert!(!flattened.contains('\n'));
+    assert!(!flattened.contains('\r'));
+
+    let crlf_multiline = "First line\r\n\r\nSecond line\twith tabs\n";
+    let flattened_crlf = flatten_cell_preview(crlf_multiline);
+    assert_eq!(flattened_crlf.as_ref(), "First line Second line with tabs");
+
+    let single_line = "No newlines here";
+    let borrowed = flatten_cell_preview(single_line);
+    assert!(matches!(borrowed, std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
+fn identifies_mono_vs_system_font_types() {
+    // Numeric and temporal types use monospace/tabular numbers
+    assert!(is_mono_column_type("int4"));
+    assert!(is_mono_column_type("bigint"));
+    assert!(is_mono_column_type("numeric"));
+    assert!(is_mono_column_type("uuid"));
+    assert!(is_mono_column_type("timestamp"));
+    assert!(is_mono_column_type("date"));
+
+    // Text and international string types use system UI font for proper script rendering
+    assert!(!is_mono_column_type("varchar"));
+    assert!(!is_mono_column_type("text"));
+    assert!(!is_mono_column_type("char"));
+    assert!(!is_mono_column_type("bpchar"));
+    assert!(!is_mono_column_type("name"));
+}
+
+#[test]
+fn visible_column_window_with_overscan_buffer() {
+    let scrollable_indices = vec![0, 1, 2, 3, 4, 5, 6, 7];
+    let column_widths = vec![100.0; 8];
+    let total_pinned_width = 40.0;
+
+    let (visible, leading, trailing) = visible_column_window_with_pinned(
+        &scrollable_indices,
+        &column_widths,
+        total_pinned_width,
+        true,
+        None,
+    );
+    assert_eq!(visible, scrollable_indices);
+    assert_eq!(leading, 0.0);
+    assert_eq!(trailing, 0.0);
 }

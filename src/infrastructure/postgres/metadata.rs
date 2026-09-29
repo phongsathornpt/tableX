@@ -2,7 +2,7 @@ use super::connect::{
     connect_with_timeout, read_only_catalog_connection_config, read_only_connection_config,
     rustls_connector,
 };
-use super::error::{format_connection_error, format_tls_connection_error};
+use super::error::{format_connection_error, format_postgres_error, format_tls_connection_error};
 use super::model::{
     PostgresConnectionProfile, PostgresServerInfo, PostgresSslMode, PostgresVersion,
 };
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_postgres::{Client, NoTls, Statement};
 
 pub(crate) const MAX_METADATA_SCHEMAS: usize = 500;
+pub(crate) const MAX_METADATA_DATABASES: usize = 500;
 pub(crate) const MAX_TABLE_PAGE_SIZE: usize = 500;
 const MAX_CACHED_READ_STATEMENTS: usize = 16;
 
@@ -169,6 +170,13 @@ const TABLE_PAGE_SCHEMA_CURSOR_QUERY: &str =
            AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
          ORDER BY c.relname
          LIMIT $4";
+const DATABASE_NAMES_QUERY: &str = "SELECT datname
+         FROM pg_database
+         WHERE datistemplate = false
+           AND datallowconn = true
+           AND has_database_privilege(datname, 'CONNECT')
+         ORDER BY datname
+         LIMIT $1::int";
 const SCHEMA_NAMES_QUERY: &str = "SELECT nspname
          FROM pg_namespace
          WHERE nspname <> 'information_schema' AND nspname NOT LIKE 'pg_%'
@@ -353,10 +361,12 @@ impl MetadataSession {
         }
         drop(statements);
 
-        let statement = client
-            .prepare(sql)
-            .await
-            .map_err(|error| DatabaseError::new(format!("could not prepare query: {error}")))?;
+        let statement = client.prepare(sql).await.map_err(|error| {
+            DatabaseError::new(format!(
+                "could not prepare query: {}",
+                format_postgres_error(&error)
+            ))
+        })?;
         let mut statements = self.read_statements.lock().await;
         if let Some(index) = statements
             .iter()
@@ -383,6 +393,13 @@ pub(crate) fn inspect(
     request: TableListRequest,
 ) -> Result<PostgresInspection, DatabaseError> {
     runtime::run(move || inspect_on_runtime(&provider.metadata_sessions, &profile, request))
+}
+
+pub(crate) fn list_databases(
+    provider: &PostgresProvider,
+    profile: PostgresConnectionProfile,
+) -> Result<Vec<String>, DatabaseError> {
+    runtime::run(move || list_databases_on_runtime(&provider.metadata_sessions, &profile))
 }
 
 pub(crate) fn test_connection(
@@ -484,12 +501,38 @@ fn inspect_on_runtime(
     })
 }
 
+fn list_databases_on_runtime(
+    sessions: &MetadataSessionCache,
+    profile: &PostgresConnectionProfile,
+) -> Result<Vec<String>, DatabaseError> {
+    let runtime = runtime::handle()?;
+    runtime.block_on(async {
+        for attempt in 0..=1 {
+            let session = sessions.get_or_connect(profile).await?;
+            let result = {
+                let client = session.client.lock().await;
+                read_database_names(&session, &client, &profile.database).await
+            };
+            if session.has_closed_client() {
+                sessions.invalidate_if_current(&session).await;
+                if attempt == 0 {
+                    continue;
+                }
+            }
+            return Ok(result);
+        }
+        unreachable!("the bounded metadata reconnect loop always returns")
+    })
+}
+
 async fn inspect_client(
     session: &MetadataSession,
     client: &Client,
     profile: &PostgresConnectionProfile,
     request: TableListRequest,
 ) -> Result<PostgresInspection, DatabaseError> {
+    let server_future = read_server_info(session, client, profile);
+    let database_future = read_database_names(session, client, &profile.database);
     let metadata_future = async {
         let schema_future = read_schema_names(session, client);
         let table_page_future = async {
@@ -503,10 +546,16 @@ async fn inspect_client(
     };
     // Poll independent metadata reads together so tokio-postgres can pipeline
     // them over this connection instead of paying one network round trip each.
-    let (server, (schemas, table_page)) =
-        futures_util::try_join!(read_server_info(session, client, profile), metadata_future)?;
+    let ((server, databases), (schemas, table_page)) = futures_util::try_join!(
+        async {
+            let (server, databases) = futures_util::join!(server_future, database_future);
+            Ok::<_, DatabaseError>((server?, databases))
+        },
+        metadata_future
+    )?;
     Ok(PostgresInspection {
         server,
+        databases,
         schemas,
         table_page,
     })
@@ -582,7 +631,8 @@ async fn prepared_statement_from(
     }
     let statement = client.prepare(query).await.map_err(|error| {
         DatabaseError::new(format!(
-            "failed to prepare PostgreSQL metadata query: {error}"
+            "failed to prepare PostgreSQL metadata query: {}",
+            format_postgres_error(&error)
         ))
     })?;
     let mut statements = cache.lock().await;
@@ -598,7 +648,10 @@ async fn read_schema_names(
         .query(&statement, &[&((MAX_METADATA_SCHEMAS + 1) as i32)])
         .await
         .map_err(|error| {
-            DatabaseError::new(format!("failed to read PostgreSQL schemas: {error}"))
+            DatabaseError::new(format!(
+                "failed to read PostgreSQL schemas: {}",
+                format_postgres_error(&error)
+            ))
         })?;
     if schema_rows.len() > MAX_METADATA_SCHEMAS {
         return Err(DatabaseError::new(format!(
@@ -613,6 +666,34 @@ async fn read_schema_names(
                 .map_err(|error| DatabaseError::new(format!("invalid schema name: {error}")))
         })
         .collect()
+}
+
+async fn read_database_names(
+    session: &MetadataSession,
+    client: &Client,
+    fallback_database: &str,
+) -> Vec<String> {
+    let Ok(statement) = prepared_statement(session, client, DATABASE_NAMES_QUERY).await else {
+        return vec![fallback_database.to_owned()];
+    };
+    let Ok(rows) = client
+        .query(&statement, &[&((MAX_METADATA_DATABASES + 1) as i32)])
+        .await
+    else {
+        return vec![fallback_database.to_owned()];
+    };
+
+    let mut databases = Vec::new();
+    for row in rows.into_iter().take(MAX_METADATA_DATABASES) {
+        if let Ok(name) = row.try_get::<_, String>(0) {
+            databases.push(name);
+        }
+    }
+    if databases.is_empty() {
+        vec![fallback_database.to_owned()]
+    } else {
+        databases
+    }
 }
 
 pub(super) async fn read_table_page_query(
@@ -691,7 +772,12 @@ async fn read_table_page_query_on_client(
             )
             .await
     }
-    .map_err(|error| DatabaseError::new(format!("failed to list PostgreSQL tables: {error}")))?;
+    .map_err(|error| {
+        DatabaseError::new(format!(
+            "failed to list PostgreSQL tables: {}",
+            format_postgres_error(&error)
+        ))
+    })?;
     #[cfg(test)]
     let database_elapsed = query_started.elapsed();
     #[cfg(test)]
@@ -758,7 +844,10 @@ async fn read_server_info(
 ) -> Result<PostgresServerInfo, DatabaseError> {
     let statement = prepared_statement(session, client, SERVER_INFO_QUERY).await?;
     let row = client.query_one(&statement, &[]).await.map_err(|error| {
-        DatabaseError::new(format!("failed to read PostgreSQL server info: {error}"))
+        DatabaseError::new(format!(
+            "failed to read PostgreSQL server info: {}",
+            format_postgres_error(&error)
+        ))
     })?;
     server_info_from_row(row, profile)
 }
@@ -771,7 +860,10 @@ async fn read_server_info_uncached(
         .query_one(SERVER_INFO_QUERY, &[])
         .await
         .map_err(|error| {
-            DatabaseError::new(format!("failed to read PostgreSQL server info: {error}"))
+            DatabaseError::new(format!(
+                "failed to read PostgreSQL server info: {}",
+                format_postgres_error(&error)
+            ))
         })?;
     server_info_from_row(row, profile)
 }
