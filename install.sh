@@ -63,7 +63,18 @@ if [ "$platform" = macos ]; then
   mkdir -p "$applications_dir"
   app_name=$(basename "$app_path")
   ditto "$app_path" "$applications_dir/$app_name"
+  bin_dir="$HOME/.local/bin"
+  mkdir -p "$bin_dir"
+  cat > "$bin_dir/tableX" <<'EOF'
+#!/bin/sh
+set -eu
+app_path="${TABLEX_APP_PATH:-$HOME/Applications/tableX.app}"
+exec open -a "$app_path" --args "$@"
+EOF
+  chmod 0755 "$bin_dir/tableX"
   printf 'Installed %s to %s\n' "$app_name" "$applications_dir"
+  printf 'Installed the tableX launcher to %s/tableX\n' "$bin_dir"
+  printf 'Make sure %s is in your PATH to launch it from a terminal.\n' "$bin_dir"
 else
   binary_path="$temporary_dir/extracted/tableX"
   if [ ! -f "$binary_path" ]; then

@@ -17,10 +17,11 @@ curl -fsSL https://raw.githubusercontent.com/phongsathornpt/tableX/main/install.
 ```
 
 The script checks the downloaded archive against the release's `SHA256SUMS`
-before installing. macOS apps are installed to `~/Applications`; Linux installs
-the executable under `~/.local/bin` and adds a desktop entry under
-`~/.local/share/applications`. On Linux, ensure `~/.local/bin` is on your
-`PATH`.
+before installing. macOS apps are installed to `~/Applications`, with a
+`tableX` terminal launcher under `~/.local/bin`. Linux installs the executable
+under `~/.local/bin` and adds a desktop entry under
+`~/.local/share/applications`. On macOS and Linux, ensure `~/.local/bin` is on
+your `PATH` to launch tableX from a terminal.
 
 Linux password storage uses the system Secret Service. A compatible keyring
 service, such as GNOME Keyring or KDE Wallet, should be available in the
